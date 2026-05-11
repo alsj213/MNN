@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Attention — MNN 学习</title><link rel="stylesheet" href="../../../mnn.css"></head>
+<body>
+<div class="study-container">
+<div class="nav"><a href="../index.html">← Transformer 总览</a><span>02 / Attention</span></div>
+<h1>Attention — 融合 QKV 投影 + Scaled Dot-Product</h1>
+<p class="status-tag now">深度完成</p>
+
+<h2>CPUAttention 总览</h2>
+<pre>// CPUAttention.cpp:1103 — 注册 OpType_Attention
+// 受 MNN_SUPPORT_TRANSFORMER_FUSE 编译开关控制
+// 1100+ 行, 支持 FP32 / FP16 / INT8 / TQ3 / TQ4 / Flash Attention
+
+输入: query, key, value, mask (可选)
+参数: mNumHead, mKvNumHead, mHeadDim, mScale = 1/√(headDim)</pre>
+
+<h2>三步标准 Attention</h2>
+<pre>Step 1 — Q @ K^T:
+  Q [seqLen, headDim] × K^T [headDim, kvLen] → scores [seqLen, kvLen]
+  乘以 mScale = 1/√(headDim), 加 mask
+
+Step 2 — Softmax:
+  softmax(scores) → probs [seqLen, kvLen]
+  在 Flash Attention 模式下在线累积 (无需完整显存)
+
+Step 3 — Softmax @ V:
+  probs [seqLen, kvLen] × V [kvLen, headDim] → output [seqLen, headDim]</pre>
+
+<h2>Q 投影打包 (onExecute L551-704)</h2>
+<pre>// 每个头独立处理
+for h in [0..mNumHead]:
+  // MNNAttenPackAndScaleSingleHead:
+  //   Q[h, :, :] [seqLen, headDim] → packed [seqLen/eP, headDim/lP, eP, lP]
+  //   同时乘 mScale = 1/√(headDim)
+  gcore->MNNAttenPackAndScaleSingleHead(
+      qReordered, query->host<int8_t>() + h*mHeadDim*mBytes,
+      mHeadDim*mNumHead, &q_scale, eP, seqLen, mHeadDim);
+
+// FP16: 额外 q_scale 防止溢出</pre>
+
+<h2>Step 1: Q @ K^T (L711-844)</h2>
+<pre>// KV 序列按 mBlockKV=64 分块处理
+
+for each kv_block:
+  ★ FP32 路径:
+    gcore->MNNPackedMatMul(qkPacked, qReordered, keyPtr, ...)
+    // [eP, headDim] × [headDim, blockKV] → [eP, blockKV]
+
+  ★ INT8 路径:
+    mInt8GemmKernel → Q 动态量化 + per-token scale
+
+  ★ TQ3/TQ4 路径:
+    Walsh-Hadamard Transform (WHT) 旋转 Q
+    Vec_dot 直接在压缩 K 上做点积 (不解压缩!)</pre>
+
+<h2>MNNPackedMatMul NEON 汇编 (MatMul 核心)</h2>
+<pre>// arm64/MNNPackedMatMul.S — 12×8 micro-kernel
+// eP=12, lP=8, hP=8 → C[12,8] tile
+
+LoopL2 (2× unrolled):
+  ld1 {v3.4s, v4.4s}, [x2], #32     // 加载 B[4,2] = 8 float
+  ld1 {v0.4s, v1.4s, v2.4s}, [x15], #48  // 加载 A[12,1] = 12 float
+
+  // 24 个累加器 (v8~v31), 每个是 4-float NEON 寄存器
+  fmla v8.4s,  v3.4s, v0.s[0]    // C[0:3, 0:3] += B[:,0] × A[0,0]
+  fmla v9.4s,  v3.4s, v0.s[1]    // C[0:3, 4:7] += B[:,0] × A[0,1]
+  fmla v10.4s, v3.4s, v1.s[0]
+  ...  // 24 条 fmla
+
+★ 24 个 NEON 累加器同时活跃, 充分隐藏访存延迟</pre>
+
+<h2>Step 2: MNNSoftmax (Attention 专用)</h2>
+<pre>// CommonOptFunction.cpp:2890 — 支持 flash attention 在线更新
+
+for each packUnit:
+  newMax = max(srcPtr[i])                        // 找块内最大值
+  finalMax = max(oldMax, newMax)                 // 在线合并历史最大值
+
+  MNNExp(dstPtr, srcPtr, exprOffset, packUnit)  // exp(x - finalMax)
+
+  if (runningMax != nullptr):                    // Flash Attention 模式
+    scaleForSum = exp(oldMax - finalMax)         // 重缩放因子
+    runningSum[k] = runningSum[k] * scaleForSum + sum
+    runningMax[k] = finalMax
+    updateScale[k] = scaleForSum                 // 用于后续输出更新
+  else:
+    scale = 1.0 / (sum + 1e-20)                  // 最终归一化
+    dst[j] *= scale</pre>
+
+<h2>MNNExp NEON 近似 (exp 快速计算)</h2>
+<pre>// CommonOptFunctionNeon.cpp:407 — 4 阶多项式 + 整数幂技巧
+
+exp(x) = 2^k × exp(r),  k = round(x / ln2),  r = x - k×ln2
+
+1. k = vrndaq_f32(vmulq_f32(x, LN2_INV))      // k = round(x/ln2)
+2. r = vfmsq_f32(x, k, LN2)                    // r = x - k*ln2
+3. P(r) = C0 + C2×r² + C4×r⁴ + r×(C1 + C3×r²) // 4th-order exp(r) approx
+4. 2^k = reinterpret<float>((k+127) << 23)     // 浮点表示的位技巧
+5. exp(x) = P(r) × 2^k</pre>
+
+<h2>Step 3: Softmax @ V + Flash Attention 输出更新</h2>
+<pre>// 标准 MatMul:
+FP32: MNNPackC4ForMatMul_A(softmax) → MNNPackedMatMul × V → output
+
+// Flash Attention (L1019-1021):
+MNNFlashAttentionUpdateBlockOutput(outputPacked, qkvPacked, diffScale,
+    runningSum, headDim/pack, seqLen, pack, blockIdx, kvBlocks, ...);
+
+// 公式: O_new = O_old × scale + softmax(QK) @ V
+// scale = exp(oldMax - newMax) ← 历史输出的退火因子
+// 最后一块: O = O / normalizeScale (最终归一化)</pre>
+
+<h2>GQA (Group Query Attention) 支持</h2>
+<pre>// L369: group_size = mNumHead / mKvNumHead
+// 例如 Qwen2: mNumHead=28, mKvNumHead=4, group_size=7
+// 每 7 个 Q 头共享同一组 KV
+
+for h in [0..mNumHead]:
+  kvHeadIndex = h / group_size    // 映射 KV 头索引
+  // Q[h] 与 K[kvHeadIndex] 做 Attention
+  // 结果写回 output[h]</pre>
+
+<h2>关键文件</h2>
+<ul>
+  <li><code>source/backend/cpu/CPUAttention.cpp</code> — Attention 融合实现 (1109 行)</li>
+  <li><code>source/backend/cpu/arm/arm64/MNNPackedMatMul.S</code> — NEON 12×8 MatMul</li>
+  <li><code>source/backend/cpu/arm/arm64/MNNPackedMatMulRemain.S</code> — 尾部 MatMul</li>
+  <li><code>source/backend/cpu/compute/CommonOptFunction.cpp:2890</code> — Attention MNNSoftmax</li>
+  <li><code>source/backend/cpu/compute/CommonOptFunction.cpp:1411</code> — FlashAttentionUpdate</li>
+  <li><code>source/backend/cpu/arm/CommonOptFunctionNeon.cpp:407</code> — MNNExp NEON</li>
+</ul>
+
+<div class="footer">2026-06-08</div>
+</div>
+</body>
+</html>

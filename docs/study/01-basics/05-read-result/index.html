@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>读取结果 — MNN 学习</title><link rel="stylesheet" href="../../../mnn.css"></head>
+<body>
+<div class="study-container">
+<div class="nav"><a href="../../../mnn.html">← 返回总览</a><span>05 / 读取结果</span></div>
+<h1>读取结果 — Tensor 访问与内存管理</h1>
+<p class="status-tag now">深度完成</p>
+
+<h2>完整调用链</h2>
+<pre>用户代码:
+  auto output = net->getSessionOutput(session, NULL);
+  auto hostTensor = new Tensor(output, Tensor::CAFFE, true);
+  output->copyToHostTensor(hostTensor);
+  float* result = hostTensor->host&lt;float&gt;();
+
+Interpreter::getSessionOutput(session, name)
+  │  std::unique_lock&lt;std::mutex&gt; _l(mNet->lock)   ← 互斥
+  │
+  └─ Session::getOutput(name)
+       │  name==NULL → mInfo.outputTensor.begin()->second
+       │  name!=NULL → mInfo.outputTensor[name]
+       │  mInfo.outputTensor 是 map&lt;string, Tensor*&gt;
+       │
+       └─ 返回 Tensor* (Device Tensor, 内存由 Backend 管理)
+
+Tensor::copyToHostTensor(hostTensor)
+  │  auto bn = mDescribe->getBackend()    ← 获取管理该 Tensor 的 Backend
+  │
+  └─ bn->onCopyBuffer(this, hostTensor)   ← Backend 负责数据搬运
+       │
+       ├─ CPU:  memcpy + NC4HW4→NCHW 格式转换
+       └─ GPU:  GPU→CPU DMA 拷贝 + 格式转换</pre>
+
+<h2>Tensor 全结构剖析</h2>
+
+<h3>两层结构：halide_buffer_t（外表）+ InsideDescribe（内核）</h3>
+<pre>class Tensor {
+    halide_buffer_t mBuffer;               // ← Halide 兼容的数据头
+    struct InsideDescribe* mDescribe;      // ← MNN 内部扩展元数据
+};
+
+// ===== Layer 1: halide_buffer_t（公开数据容器）=====
+typedef struct halide_buffer_t {
+    uint64_t device;                           // GPU 设备指针/句柄
+    const halide_device_interface_t* device_interface;
+    uint8_t* host;                             // CPU 可访问指针（malloc 或 nullptr）
+    uint64_t flags;                            // host_dirty / device_dirty 脏标记
+    halide_type_t type;                        // {code(halide_type_float), bits(32), lanes(1)}
+    int32_t dimensions;                        // 维度数 (1~8)
+    halide_dimension_t* dim;                   // 各维度的 {min, extent, stride}
+    void* padding;
+} halide_buffer_t;
+
+typedef struct halide_dimension_t {
+    int32_t min, extent, stride;               // 起始偏移, 大小, 步长
+    uint32_t flags;
+} halide_dimension_t;
+
+// ===== Layer 2: InsideDescribe（MNN 私有元数据）=====
+struct InsideDescribe {
+    struct NativeInsideDescribe {
+        MNN_DATA_FORMAT dimensionFormat;       // NC4HW4 / NCHW / NHWC
+        MemoryType memoryType;                 // 谁管的这块内存?
+        Usage usage;                           // 语义角色
+        std::vector&lt;Region&gt; regions;            // Raster 用的子区域
+        halide_dimension_t dims[8];            // 实际维度数据
+        int useCount;                           // 内存复用引用计数
+        int index;                             // 在 Net 中的全局索引
+        int group;                             // Pipeline 内分组
+        QuantAttr quantAttr;                   // 量化参数 {scale, zero, min, max}
+        pad mPads;                             // 边界填充
+        SharedPtr&lt;Backend::MemObj&gt; mem;        // Backend 内存句柄
+        int offset;                            // 在 mem 中的偏移
+        // + 更多...
+    };
+    Backend* backend;                          // 管理该 Tensor 的 Backend
+};
+
+// 访问链: Tensor → mDescribe → mContent → dimensionFormat / memoryType / useCount / ...
+// TensorUtils::getDescribe(t) = t->mDescribe->mContent.get()</pre>
+
+<h3>MemoryType 枚举 — 内存谁管？</h3>
+<table>
+<tr><th>类型</th><th>host 指针</th><th>deviceId</th><th>生命周期</th><th>典型场景</th></tr>
+<tr><td>MEMORY_BACKEND</td><td>可能有/nullptr</td><td>有值</td><td>Backend::onAcquireBuffer 分配</td><td>Session 内所有 Tensor</td></tr>
+<tr><td>MEMORY_HOST</td><td>有值(malloc)</td><td>0</td><td>Tensor 构造/析构管理</td><td>用户创建的 Host Tensor</td></tr>
+<tr><td>MEMORY_VIRTUAL</td><td>nullptr</td><td>0</td><td>无实际内存</td><td>Raster 重映射 Tensor</td></tr>
+<tr><td>MEMORY_OUTSIDE</td><td>外部指针</td><td>0</td><td>Tensor 不管</td><td>用户传入数据指针</td></tr>
+</table>
+
+<h3>Usage 枚举 — Tensor 语义角色</h3>
+<pre>enum Usage {
+    NORMAL,       // 中间结果（绝大多数 Tensor）
+    INPUT,        // 模型输入
+    OUTPUT,       // 模型输出
+    CONSTANT,     // 常量（权重/BN参数），encode 阶段已算好
+    TRAINABLE,    // 可训练参数
+};</pre>
+
+<h2>获取输出：getSessionOutput 全链路</h2>
+<pre>// Interpreter.cpp:456
+Tensor* Interpreter::getSessionOutput(const Session* session, const char* name) {
+    if (session == nullptr) return nullptr;
+    std::unique_lock&lt;std::mutex&gt; _l(mNet->lock);       // ① 与 createSession/resizeSession 互斥
+    auto tensor = session->getOutput(name);              // ② 查 Session 内部 map
+    mNet->tensorMap.insert({tensor, session});           // ③ 记录 Tensor→Session 归属
+    return tensor;                                       // ④ 返回 Device Tensor
+}
+
+// Session.cpp:426
+Tensor* Session::getOutput(const char* name) const {
+    MNN_ASSERT(!mInfo.outputTensor.empty());
+    if (nullptr == name) {
+        return mInfo.outputTensor.begin()->second;       // 无名字 → 第一个输出
+    }
+    auto iter = mInfo.outputTensor.find(name);           // 按 tensorName 查找
+    if (iter == mInfo.outputTensor.end()) {
+        MNN_PRINT("Error: can't find output: %s\n", name);
+        return nullptr;
+    }
+    return iter->second;
+}
+
+// mInfo.outputTensor 的来源（Schedule::schedule 阶段建立）:
+//   map&lt;string, Tensor*&gt; outputTensor
+//   key:    flatbuffers 中 tensorName() 字符串（如 "fc_output"）
+//   value:  指向 mInfo.allTensors[id] 中对应 Tensor 的指针</pre>
+
+<h3>tensorMap 的作用</h3>
+<pre>// Interpreter 维护: map&lt;Tensor*, const Session*&gt; tensorMap
+//
+// 用途: 记录每个外部可见 Tensor 属于哪个 Session
+// 用于:
+//   1. waitSessionFinish — 等待特定 Session 的 GPU 操作完成
+//   2. releaseSession  — 释放时检查 Tensor 归属
+//   3. runSession      — 确保同一 Interpreter 串行</pre>
+
+<h2>读取数据：copyToHostTensor 深度分析</h2>
+
+<h3>方式一：copyToHostTensor（推荐，跨后端通用）</h3>
+<pre>// 步骤:
+// ① 创建 Host Tensor（带 malloc 内存，MEMORY_HOST）
+auto hostOutput = new Tensor(output, Tensor::CAFFE, true);
+//  Tensor(tensor, type, allocMemory=true):
+//    复制 shape/dim → setLinearLayout → malloc(size) → host 有值
+
+// ② Device → Host 拷贝
+output->copyToHostTensor(hostOutput);
+
+// ③ 读数据（NCHW 格式）
+float* data = hostOutput->host&lt;float&gt;();
+
+// ===== copyToHostTensor 内部实现 (Tensor.cpp:187) =====
+bool Tensor::copyToHostTensor(Tensor* hostTensor) const {
+    auto bn = mDescribe->getBackend();   // 获取后端
+    if (nullptr == bn) return false;
+    bn->onCopyBuffer(this, hostTensor);  // 委托给 Backend
+    return true;
+}</pre>
+
+<h3>方式二：直接读 host 指针（仅 CPU 后端）</h3>
+<pre>float* data = output->host&lt;float&gt;();
+// ⚠️ 仅在 CPU 后端保证 host 有值
+// ⚠️ GPU 后端 host 为 nullptr，需用 copyToHostTensor
+// ⚠️ 数据是 NC4HW4 格式！直接读会得到错误排列</pre>
+
+<h3>方式三：Tensor::map / unmap（高级用法，零拷贝）</h3>
+<pre>// map: 获取 GPU Tensor 的 host 可读指针
+void* ptr = tensor->map(Tensor::MAP_TENSOR_READ, Tensor::CAFFE);
+float* data = (float*)ptr;  // 直接读
+
+// unmap: 释放映射（WRITE 模式会写回 GPU）
+tensor->unmap(Tensor::MAP_TENSOR_READ, Tensor::CAFFE, ptr);
+
+// 内部流程:
+// MAP_TENSOR_READ:
+//   ① Backend::onSync(READ, false, this) — 确保 GPU 计算完成
+//   ② Backend::onMapTensor — 尝试 GPU 直接映射
+//   ③ 若失败: malloc → onCopyBuffer(device→host)
+// MAP_TENSOR_WRITE:
+//   ① onMapTensor / malloc
+//   ② unmap 时 onCopyBuffer(host→device) 写回</pre>
+
+<h2>CPU Backend::onCopyBuffer — 完整数据搬运流程</h2>
+<pre>// CPUBackend.cpp:778
+void CPUBackend::onCopyBuffer(const Tensor* src, const Tensor* dst) const {
+    _resetDynamicMemory();
+
+    // Step 1: 维度检查
+    //   src 和 dst 维度数不同 → 仅当最后一维 extent=1 才允许
+    //   src 和 dst 维度类型相同 → 断言各维 extent 匹配
+
+    // Step 2: host 指针检查
+    if (nullptr == srcBuffer.host || nullptr == dstBuffer.host) return;
+
+    // Step 3: 数据类型转换（如果 src/dst 类型不同）
+    if (getDataType(src) != getDataType(dst)) {
+        // 创建临时 Tensor，用 CPUCastCreator::cast 做类型转换
+        //   FLOAT→INT8 或 INT8→FLOAT
+        wrapTensor.reset(Tensor::createDevice(src->shape(), dst->getType()));
+        wrapTensor->buffer().host = malloc(...);
+        CPUCastCreator::cast(src, wrapTensor, this, convertType);
+        src = wrapTensor.get();  // 用转换后的作为源
+    }
+
+    // Step 4: 数据格式转换（核心）
+    auto code = CPUTensorConverter::convert(src, dst);
+    //   NC4HW4 → NCHW / NHWC 或其他格式组合
+}
+
+// CPU 端 onCopyBuffer 做了两件事:
+//   1. 类型转换（如 INT8→FLOAT）
+//   2. 数据布局转换（NC4HW4 → NCHW/NHWC）</pre>
+
+<h2>CPUTensorConverter::convert — 格式转换核心</h2>
+<pre>// CPUTensorConvert.hpp:20
+static ErrorCode convert(const Tensor* input, const Tensor* output,
+                         const CoreFunctions* core, int tId, int numberThread);
+static ErrorCode convert(const void* inputRaw, void* outputRaw,
+                         MNN_DATA_FORMAT inputFormat, MNN_DATA_FORMAT outputFormat,
+                         int batch, int area, int channel, int bytes, ...);
+
+// 支持的格式转换:
+//   NC4HW4 ↔ NCHW  (最常见: 内部格式 → 用户格式)
+//   NC4HW4 ↔ NHWC
+//   NCHW  ↔ NHWC
+//
+// 策略: 根据源/目标格式组合选择最优的转换函数
+//   大通道时用 MNNPackC4 / MNNUnpackC4 (NEON 优化)
+//   小通道时用 MNNPackC4Origin / MNNUnpackC4Origin</pre>
+
+<h2>设置输入：copyFromHostTensor 全流程</h2>
+<pre>// 获取输入 Tensor（Device Tensor, MEMORY_BACKEND）
+auto input = net->getSessionInput(session, NULL);
+
+// 创建 Host Tensor 填数据
+auto hostInput = new Tensor(input, Tensor::CAFFE, true);
+float* data = hostInput->host&lt;float&gt;();
+// 填入 NCHW 格式数据...
+
+// Host → Device 拷贝
+input->copyFromHostTensor(hostInput);
+
+// ===== copyFromHostTensor 内部实现 (Tensor.cpp:171) =====
+bool Tensor::copyFromHostTensor(const Tensor* hostTensor) {
+    auto bn = mDescribe->getBackend();
+    if (nullptr == bn) return false;
+
+    // 跨后端处理: hostTensor 也有自己的 Backend?
+    auto hostbn = hostTensor->mDescribe->getBackend();
+    if (nullptr != hostbn && hostbn->type() != bn->type()
+                         && hostbn->type() != MNN_FORWARD_CPU) {
+        // 先拷贝到临时 CPU Host Tensor
+        tmpTensor.reset(new Tensor(hostTensor, hostTensor->getDimensionType()));
+        hostTensor->copyToHostTensor(tmpTensor.get());
+        hostTensor = tmpTensor.get();
+    }
+
+    bn->onCopyBuffer(hostTensor, this);  // 委托 Backend
+    return true;
+}</pre>
+
+<h2>5 步推理完整循环（逐行注释）</h2>
+<pre>// ① 加载模型
+auto net = Interpreter::createFromFile("model.mnn");
+//    → FileLoader::load → GetNet(buf) → Net* (FlatBuffers, 零拷贝)
+
+// ② 创建 Session
+ScheduleConfig config;
+config.type = MNN_FORWARD_AUTO;
+auto session = net->createSession(config);
+//    → createRuntime → Schedule::schedule → backend.onCreate
+//    → ge.measure → allocMemory (Execution + Copy + useCount)
+
+// ③ 设置输入 + resize
+auto input = net->getSessionInput(session, NULL);
+auto hostInput = new Tensor(input, Tensor::CAFFE, true);
+memcpy(hostInput->host&lt;float&gt;(), imageData, input->size());
+input->copyFromHostTensor(hostInput);
+//    → Backend::onCopyBuffer: NCHW→NC4HW4 格式转换
+net->resizeSession(session);
+//    → Session::resize: encode + allocMemory
+
+// ④ 执行推理
+net->runSession(session);
+//    → mutex lock → _copyInputs → _enterExecute
+//    → for OpCacheInfo → for Command → onExecute
+//    → _exitExecute
+
+// ⑤ 读取输出
+auto output = net->getSessionOutput(session, NULL);
+//    → mutex lock → Session::getOutput → tensorMap.insert
+auto hostOutput = new Tensor(output, Tensor::CAFFE, true);
+output->copyToHostTensor(hostOutput);
+//    → Backend::onCopyBuffer: NC4HW4→NCHW 格式转换 + memcpy
+float* result = hostOutput->host&lt;float&gt;();</pre>
+
+<h2>数据格式转换全景</h2>
+<table>
+<tr><th>阶段</th><th>源格式</th><th>目标格式</th><th>转换函数</th></tr>
+<tr><td>copyFromHostTensor（输入）</td><td>NCHW/NHWC（用户Host）</td><td>NC4HW4（Device）</td><td>CPUTensorConverter::convert + MNNPackC4</td></tr>
+<tr><td>Pipeline 内部计算</td><td>NC4HW4</td><td>NC4HW4</td><td>无需转换</td></tr>
+<tr><td>op onExecute</td><td>NC4HW4</td><td>NC4HW4</td><td>直接计算</td></tr>
+<tr><td>copyToHostTensor（输出）</td><td>NC4HW4（Device）</td><td>NCHW/NHWC（用户Host）</td><td>CPUTensorConverter::convert + MNNUnpackC4</td></tr>
+<tr><td>跨后端 Copy</td><td>源后端格式</td><td>目标后端格式</td><td>通过 CPU Host Tensor 中转</td></tr>
+</table>
+
+<h2>Tensor 内存分配双途径</h2>
+<pre>// 途径 A：用户创建 Host Tensor
+auto t = new Tensor(shape, Tensor::CAFFE, true);
+//   → mDescribe->memoryType = MEMORY_HOST
+//   → mBuffer.host = MNNMemoryAllocAlign(size)
+//   → mBuffer.device = 0
+//   析构时: MNNMemoryFreeAlign(mBuffer.host)
+
+// 途径 B：引擎创建 Device Tensor (Session 内部)
+auto t = Tensor::createDevice(shape, halide_type_of&lt;float&gt;());
+//   → mDescribe->memoryType = MEMORY_BACKEND
+//   → mBuffer.host = nullptr
+//   → mBuffer.device = 0 (待 Backend 分配)
+//   allocMemory 时: Backend::onAcquireBuffer → 分配真实内存
+
+// 途径 C：用户传入数据指针
+auto t = Tensor::create(shape, halide_type_of&lt;float&gt;(), userData);
+//   → mDescribe->memoryType = MEMORY_HOST
+//   → mBuffer.host = userData (外部指针，Tensor 不管释放)
+
+// 途径 D：零拷贝 clone（用于常量折叠结果）
+auto t = Tensor::clone(src, false);  // deepCopy=false
+//   → 共享 src 的 mDescribe->mContent 和 mBuffer
+//   → 不分配新内存</pre>
+
+<h2>关键文件</h2>
+<ul>
+  <li><code>include/MNN/Tensor.hpp</code> — Tensor 类定义</li>
+  <li><code>include/MNN/HalideRuntime.h:204</code> — halide_buffer_t 结构体</li>
+  <li><code>source/core/Tensor.cpp:171</code> — copyFromHostTensor</li>
+  <li><code>source/core/Tensor.cpp:187</code> — copyToHostTensor</li>
+  <li><code>source/core/Tensor.cpp:427</code> — map / unmap</li>
+  <li><code>source/core/Tensor.cpp:20-115</code> — Tensor 构造/析构</li>
+  <li><code>source/core/TensorUtils.hpp:40-126</code> — InsideDescribe 完整定义</li>
+  <li><code>source/core/TensorUtils.hpp:131-220</code> — TensorUtils 工具类</li>
+  <li><code>source/core/TensorUtils.cpp:19-21</code> — getDescribe 实现</li>
+  <li><code>source/core/Interpreter.cpp:446</code> — getSessionInput</li>
+  <li><code>source/core/Interpreter.cpp:456</code> — getSessionOutput</li>
+  <li><code>source/core/Interpreter.cpp:475</code> — getSessionOutputAll</li>
+  <li><code>source/core/Session.cpp:410</code> — Session::getInput</li>
+  <li><code>source/core/Session.cpp:426</code> — Session::getOutput</li>
+  <li><code>source/backend/cpu/CPUBackend.cpp:778</code> — CPU onCopyBuffer 实现</li>
+  <li><code>source/backend/cpu/CPUTensorConvert.hpp</code> — 格式转换核心</li>
+</ul>
+
+<h2>面试重点</h2>
+
+<div class="qa">
+<div class="q">Host Tensor 和 Device Tensor 的本质区别是什么？</div>
+<div class="a"><b>Host Tensor</b>：mDescribe->memoryType = MEMORY_HOST，mBuffer.host 指向 malloc 内存，用户可任意读写，析构时自动 free。<b>Device Tensor</b>：memoryType = MEMORY_BACKEND，mBuffer.host 可能为空，实际数据在 GPU/后端上，需通过 copyToHostTensor 或 map 才能读到 CPU。Session 内所有 Tensor 都是 Device Tensor。</div>
+</div>
+
+<div class="qa">
+<div class="q">copyToHostTensor 内部做了什么？</div>
+<div class="a">① 获取 Tensor 关联的 Backend ② 调用 Backend::onCopyBuffer(this, hostTensor)。CPU 端做两件事：类型转换（如 INT8→FLOAT）+ 数据布局转换（NC4HW4→NCHW/NHWC）。GPU 端先确保 GPU 计算完成，再通过 DMA 拷贝到 host。</div>
+</div>
+
+<div class="qa">
+<div class="q">为什么不直接读 output->host<float>()？</div>
+<div class="a">两个原因：① GPU 后端 host 为 nullptr（数据在显存上）② CPU 后端虽然有 host，但数据是 NC4HW4 格式（通道按 4 打包），直接当 NCHW 读会得到错误排列。必须经过 copyToHostTensor 做格式转换。</div>
+</div>
+
+<div class="qa">
+<div class="q">getSessionOutput 返回的 Tensor 和 Session 的关系？</div>
+<div class="a">返回的是 Session::mInfo.outputTensor 中的指针，生命周期与 Session 绑定。Session 释放后指针失效。Interpreter 通过 tensorMap 记录此关系，用于 waitSessionFinish 和 releaseSession。</div>
+</div>
+
+<div class="qa">
+<div class="q">NC4HW4 是什么，为什么用它？</div>
+<div class="a">NC4HW4 = 通道维度按 4 打包到宽度维度之前。4 通道一组对齐到 SIMD 128-bit 寄存器，消除跨通道 stride 开销。所有引擎内部数据都用 NC4HW4，输入时 NCHW→NC4HW4（Pack），输出时 NC4HW4→NCHW（Unpack），内部无转换。</div>
+</div>
+
+<div class="qa">
+<div class="q">cross-backend copy 怎么处理？</div>
+<div class="a">copyFromHostTensor 中检查源 Tensor 的 Backend 类型，如果是非 CPU 非目标类型的后端，先 copyToHostTensor 到临时 CPU Host Tensor（走 GPU→CPU），再 copyFromHostTensor（走 CPU→目标后端）。Copy 以 CPU 为中转站。</div>
+</div>
+
+<div class="qa">
+<div class="q">Tensor::map 和 copyToHostTensor 的区别？</div>
+<div class="a"><b>map</b>：零拷贝映射，直接拿到 GPU 内存的 host 可访问指针（通过 OpenCL map/unmap 或 Metal 的 contents），适合一次性读取。<b>copyToHostTensor</b>：完整拷贝一份到新内存，数据转为用户格式（NCHW），适合持久保存或多次访问。map/unmap 必须配对使用。</div>
+</div>
+
+<div class="qa">
+<div class="q">5 步推理循环中哪些调用需要锁？</div>
+<div class="a">getSessionInput/getSessionOutput：mutex lock（防止与 createSession 并发修改 tensorMap）。createSession/resizeSession/runSession/releaseSession：mutex lock（同一 Interpreter 串行）。仅 runSessionWithCallBack 默认不加锁（由调用者保证安全）。</div>
+</div>
+
+<h2>深度总结</h2>
+<div class="checklist">
+<div class="checklist-item done">✅ Tensor = halide_buffer_t (公开) + InsideDescribe (私有元数据)，两层结构分离数据与语义</div>
+<div class="checklist-item done">✅ MemoryType 4 种: BACKEND (Backend管理) / HOST (malloc) / VIRTUAL (无内存) / OUTSIDE (外部指针)</div>
+<div class="checklist-item done">✅ Usage 5 种: NORMAL / INPUT / OUTPUT / CONSTANT / TRAINABLE，标记 Tensor 语义角色</div>
+<div class="checklist-item done">✅ getSessionOutput: mutex → Session::getOutput(name) → outputTensor map 查找 → tensorMap 记录归属</div>
+<div class="checklist-item done">✅ copyToHostTensor: getBackend → onCopyBuffer → 类型转换(Cast) + 格式转换(NC4HW4→NCHW)</div>
+<div class="checklist-item done">✅ copyFromHostTensor: getBackend → 跨后端中转(如GPU→CPU→目标) → onCopyBuffer</div>
+<div class="checklist-item done">✅ CPUBackend::onCopyBuffer 核心: 类型 Cast (FLOAT/INT8) + CPUTensorConverter convert (NC4HW4↔NCHW↔NHWC)</div>
+<div class="checklist-item done">✅ map/unmap 零拷贝路径: onSync 确保完成 → onMapTensor 尝试映射 → 失败则 malloc 中转</div>
+<div class="checklist-item done">✅ tensorMap: Interpreter 维护 Tensor→Session 映射，用于 waitSessionFinish 等待 GPU 操作</div>
+<div class="checklist-item done">✅ 5 步循环: load → createSession → setInput+resize → runSession → getOutput+copyToHostTensor</div>
+<div class="checklist-item done">✅ 数据格式转换仅在边界发生: 输入 NCHW→NC4HW4, 输出 NC4HW4→NCHW, 内部全程 NC4HW4</div>
+</div>
+
+<div class="footer">2026-05-18 · 深度更新 2026-06-03</div>
+</div>
+</body>
+</html>

@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>CNN 模型 — MNN 学习</title><link rel="stylesheet" href="../../mnn.css"></head>
+<body>
+<div class="study-container">
+<div class="nav"><a href="../../mnn.html">← 返回总览</a><span>第二阶段 / CNN 模型</span></div>
+<h1>CNN 模型 — 卷积神经网络推理</h1>
+<p class="status-tag">学习中</p>
+
+<h2>概览</h2>
+<p>CNN 是推理引擎最核心的负载，MNN 对卷积实现了多种算法策略：Im2Col+GEMM、Winograd、Strassen、深度可分离、INT8 量化等，根据卷积参数自动选择最优实现。</p>
+
+<h2>核心主题</h2>
+
+<h3>1. Im2Col + GEMM（通用卷积）</h3>
+<table>
+<tr><th>文件</th><th>说明</th></tr>
+<tr><td><code>source/backend/cpu/compute/ConvolutionTiledExecutor.cpp</code></td><td>Im2Col 参数计算 (setIm2ColParameter, <a href="01-im2col-gemm/index.html">turnIm2ColToBlitInfo</a>)</td></tr>
+<tr><td><code>source/backend/cpu/compute/DenseConvolutionTiledExecutor.cpp</code></td><td>密集卷积 onResize/onExecute, 线程分片 + MatMul</td></tr>
+<tr><td><code>source/backend/cpu/compute/ConvolutionFloatFactory.cpp</code></td><td>卷积工厂：根据参数选择 Im2Col / Winograd / 1x1 / 深度可分离</td></tr>
+<tr><td><code>source/backend/cpu/compute/Convolution1x1Strassen.cpp</code></td><td>1×1 卷积的 Strassen 矩阵乘优化</td></tr>
+<tr><td><code>source/backend/cpu/compute/ConvOpt.cpp</code></td><td>卷积优化选项（调优配置）</td></tr>
+<tr><td><code>source/backend/cpu/arm/arm64/MNNPackC4ForMatMul_A.S</code></td><td>NEON 汇编：NC4HW4 → Packed Matrix</td></tr>
+</table>
+
+<h3>2. Winograd 算法（3×3 专用）</h3>
+<table>
+<tr><th>文件</th><th>说明</th></tr>
+<tr><td><code>source/backend/cpu/compute/ConvolutionWinogradImpl.cpp</code></td><td>Winograd F(2,3) / F(4,3) 实现核心</td></tr>
+<tr><td><code>source/backend/cpu/compute/ConvolutionWinogradBridge.cpp</code></td><td>Winograd 输入输出变换</td></tr>
+<tr><td><code>source/backend/cpu/compute/ConvolutionPackWinograd.cpp</code></td><td>Winograd 权重打包</td></tr>
+<tr><td><code>source/backend/cpu/compute/ConvolutionPackFreeWinograd.cpp</code></td><td>无 Pack 内存的 Winograd 实现</td></tr>
+<tr><td><code>source/backend/cpu/compute/WinogradOptFunction.cpp</code></td><td>Winograd 变换函数 (B^T·x·B / A^T·y·A)</td></tr>
+</table>
+
+<h3>3. 深度可分离卷积 & 分组卷积</h3>
+<table>
+<tr><th>文件</th><th>说明</th></tr>
+<tr><td><code>source/backend/cpu/CPUConvolutionDepthwise.cpp</code></td><td>Depthwise 卷积（channel-wise 卷积）</td></tr>
+<tr><td><code>source/backend/cpu/CPUDepthwiseConvInt8.cpp</code></td><td>INT8 深度可分离卷积</td></tr>
+<tr><td><code>source/backend/cpu/compute/ConvolutionGroup.cpp</code></td><td>分组卷积（Group Convolution）</td></tr>
+</table>
+
+<h3>4. INT8 量化卷积</h3>
+<table>
+<tr><th>文件</th><th>说明</th></tr>
+<tr><td><code>source/backend/cpu/compute/ConvInt8TiledExecutor.cpp</code></td><td>INT8 Im2Col+GEMM 卷积</td></tr>
+<tr><td><code>source/backend/cpu/compute/ConvInt8Winograd.cpp</code></td><td>INT8 Winograd 卷积</td></tr>
+<tr><td><code>source/backend/cpu/compute/ConvolutionIntFactory.cpp</code></td><td>INT8 卷积工厂（选择最优实现）</td></tr>
+<tr><td><code>source/backend/cpu/compute/IdstConvolutionInt8.cpp</code></td><td>IDST 量化方案卷积</td></tr>
+<tr><td><code>source/backend/cpu/CPUTFQuantizedConv2D.cpp</code></td><td>TensorFlow 风格量化卷积</td></tr>
+<tr><td><code>source/backend/cpu/CPUDynamicQuant.cpp</code></td><td>动态量化（运行时计算 scale/zero）</td></tr>
+</table>
+
+<h3>5. NC4HW4 数据布局</h3>
+<ul>
+  <li><code>include/MNN/Tensor.hpp</code> — DimensionType::CAFFE_C4</li>
+  <li><code>source/core/TensorUtils.hpp</code> — MNN_DATA_FORMAT_NC4HW4</li>
+  <li><code>source/backend/cpu/CPUTensorConvert.cpp</code> — NC4HW4 ↔ NCHW 转换</li>
+</ul>
+
+<h3>6. 稀疏卷积</h3>
+<table>
+<tr><th>文件</th><th>说明</th></tr>
+<tr><td><code>source/backend/cpu/compute/SparseConvolutionTiledExecutor.cpp</code></td><td>稀疏权重卷积</td></tr>
+<tr><td><code>source/backend/cpu/compute/SparseConvInt8TiledExecutor.cpp</code></td><td>INT8 稀疏卷积</td></tr>
+</table>
+
+<h2>关键架构图</h2>
+<pre>用户输入 [NCHW]
+  └─ CPUTensorConvert ──→ NC4HW4 格式
+       └─ ConvolutionFloatFactory::create() ──→ 选择算法:
+            ├─ kernel=1×1 ──→ Convolution1x1Strassen
+            ├─ kernel=3×3, s=1 ──→ Winograd (F(2,3) / F(4,3))
+            ├─ group=channel ──→ CPUConvolutionDepthwise
+            ├─ INT8 ──→ ConvInt8TiledExecutor / ConvInt8Winograd
+            └─ 通用 ──→ DenseConvolutionTiledImpl (Im2Col + GEMM)
+                 ├─ Im2Col: 数据重排 (0 FLOP)
+                 ├─ Pack: MNNPackC4ForMatMul_A (NEON ld1/trn/stp)
+                 └─ MatMul: MNNPackedMatMul (NEON fmla)</pre>
+
+<h2>面试重点</h2>
+<div class="qa">
+<div class="q">Im2Col + GEMM 的原理？</div>
+<div class="a">将卷积的滑动窗口访存转化为矩阵乘法。Im2Col 把每个窗口拉成行向量 [oh×ow, ic×kh×kw]，权重展成 [oc, ic×kh×kw]，做矩阵乘得到 [oh×ow, oc]。FLOPs 不变，但变成规整 GEMM 可利用 BLAS/SIMD 加速。</div>
+</div>
+<div class="qa">
+<div class="q">Winograd 为什么比 Im2Col 快？</div>
+<div class="a">Winograd 通过数学变换减少乘法次数。F(2×2, 3×3) 用 16 次乘代替直接卷积的 36 次乘（2.25× 减少），代价是更多的加法。适合 3×3 小核 + stride=1。</div>
+</div>
+<div class="qa">
+<div class="q">深度可分离卷积与普通卷积的区别？</div>
+<div class="a">普通卷积：每个输出通道看所有输入通道。Depthwise：每个输出通道只看自己对应的输入通道（group=channel）。计算量从 O(ic×oc×k²) 降为 O(ic×k²)，MobileNet 核心思路。</div>
+</div>
+<div class="qa">
+<div class="q">INT8 量化如何减少计算量？</div>
+<div class="a">INT8 乘加比 FP32 快 2-4×（SIMD 一次处理更多元素），内存带宽减半。需要 scale/zero_point 做量化反量化，部分后端有专门 INT8 指令（ARM v8.2 dot product）。</div>
+</div>
+
+<h2>学习路径建议</h2>
+<ol>
+  <li>Im2Col + GEMM 完整链路（ConvolutionTiledExecutor → DenseConvolutionTiledExecutor → MNNPackC4ForMatMul_A.S）</li>
+  <li>Winograd F(2,3) 数学原理 + ConvolutionWinogradImpl 实现</li>
+  <li>Depthwise / Group Convolution 实现</li>
+  <li>NC4HW4 布局的 SIMD 意义（与 NCHW/NHWC 对比）</li>
+  <li>INT8 量化卷积（scale/zero_point 计算 + 反量化）</li>
+</ol>
+
+<div class="footer">2026-06-05</div>
+</div>
+</body>
+</html>

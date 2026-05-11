@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Demo 分析 — MNN 学习</title><link rel="stylesheet" href="../../../mnn.css"></head>
+<body>
+<div class="study-container">
+<div class="nav"><a href="../../../mnn.html">← 返回总览</a><span>06 / Demo 分析</span></div>
+<h1>pictureRecognition.cpp 逐阶段解析</h1>
+<p class="status-tag done">已完成</p>
+<p><code>demo/exec/pictureRecognition.cpp</code> 演示 Session API 完整调用链：</p>
+
+<h2>① 模型加载（L32-34）</h2>
+<pre>std::shared_ptr&lt;Interpreter&gt; net(
+    Interpreter::createFromFile(argv[1]));
+net->setCacheFile(".cachefile");</pre>
+
+<h2>② 创建 Session（L35-41）</h2>
+<pre>ScheduleConfig config;
+config.type = MNN_FORWARD_AUTO;
+auto session = net->createSession(config);</pre>
+
+<h2>③ resize 图优化（L43-55）</h2>
+<pre>auto input = net->getSessionInput(session, NULL);
+shape[0] = argc - 2;
+net->resizeSession(session);</pre>
+
+<h2>④ 推理执行（L121）</h2>
+<pre>net->runSession(session);</pre>
+<p>→ Session::run() → Pipeline::execute() → Execution::onExecute()</p>
+
+<h2>⑤ 读取结果（L122-159）</h2>
+<pre>output->copyToHostTensor(outputUser.get());
+auto values = outputUser->host&lt;float&gt;();</pre>
+
+<h2>runSession 内部三层遍历</h2>
+<pre>net->runSession(session)
+  └ Session::run()
+      └ for each Pipeline:
+          └ Pipeline::execute()
+              ├ _copyInputs()
+              ├ _enterExecute()
+              └ for each OpCacheInfo:
+                  └ for each Command:
+                      └ cmd.execution->onExecute(inputs, outputs)
+              └ _exitExecute()</pre>
+
+<h2>对应表</h2>
+<pre>| 行号 | 调用                      | 阶段          |
+|------|---------------------------|---|
+| L32  | Interpreter::createFromFile | ① 模型加载  |
+| L36  | createSession(config)     | ② 创建Session|
+| L47  | resizeSession(session)    | ③ 图优化     |
+| L121 | runSession(session)       | ④ 推理执行   |
+| L126 | copyToHostTensor          | ⑤ 读取结果   |</pre>
+
+<div class="footer">2026-05-16</div>
+</div>
+</body>
+</html>

@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Transformer — MNN 学习</title><link rel="stylesheet" href="../../mnn.css"></head>
+<body>
+<div class="study-container">
+<div class="nav"><a href="../../mnn.html">← 返回总览</a><span>第三阶段 / Transformer</span></div>
+<h1>Transformer — 自注意力与结构优化</h1>
+<p class="status-tag">待学习</p>
+
+<h2>概览</h2>
+<p>Transformer 是现代 LLM 的核心架构。MNN 对 Attention、LayerNorm、Softmax、RoPE 等 Transformer 关键算子做了专项优化，并为 LLM 推理扩展了 Prefill/Decode 两阶段和 KV Cache 管理。</p>
+
+<h2>核心主题</h2>
+
+<h3>1. Attention 算子</h3>
+<table>
+<tr><th>文件</th><th>说明</th></tr>
+<tr><td><code>source/backend/cpu/CPUAttention.cpp</code></td><td>CPU Attention 实现（Q·K^T → Scale → Softmax → ×V）</td></tr>
+<tr><td><code>source/backend/cpu/CPUAttention.hpp</code></td><td>Attention 参数结构（head_num, head_dim, scale）</td></tr>
+<tr><td><code>source/backend/cpu/CPULinearAttention.cpp</code></td><td>线性 Attention（低复杂度变体）</td></tr>
+</table>
+
+<h3>2. 关键算子</h3>
+<table>
+<tr><th>文件</th><th>说明</th></tr>
+<tr><td><code>source/backend/cpu/CPULayerNorm.cpp</code></td><td>LayerNorm（Transformer 标配归一化）</td></tr>
+<tr><td><code>source/backend/cpu/CPUSoftmax.cpp</code></td><td>Softmax（支持多维度 + 量化）</td></tr>
+<tr><td><code>source/backend/cpu/CPUInstanceNorm.cpp</code></td><td>InstanceNorm</td></tr>
+<tr><td><code>source/backend/cpu/CPUReduction.cpp</code></td><td>Reduction（Sum/Mean/Max，LayerNorm 依赖）</td></tr>
+<tr><td><code>source/backend/cpu/CPUBinary.cpp</code></td><td>BinaryOp（Add/Mul/Sub，残差连接依赖）</td></tr>
+<tr><td><code>source/backend/cpu/CPURaster.cpp</code></td><td>Raster（内存重排，transpose/reshape/concat 底层）</td></tr>
+</table>
+
+<h3>3. Op 注册模式</h3>
+<table>
+<tr><th>文件</th><th>说明</th></tr>
+<tr><td><code>source/backend/cpu/CPUOPRegister.cpp</code></td><td>CPU 后端 Op 注册（REGISTER_CPU_OP_CREATOR 宏）</td></tr>
+<tr><td><code>source/shape/SizeComputer.cpp</code></td><td>形状推导注册（REGISTER_SHAPE 宏）</td></tr>
+<tr><td><code>source/geometry/GeometryComputer.cpp</code></td><td>几何分解注册（REGISTER_GEOMETRY 宏）</td></tr>
+<tr><td><code>source/core/Backend.hpp</code></td><td>Backend::onCreate 纯虚函数（各后端实现 Op 工厂）</td></tr>
+<tr><td><code>schema/default/MNN.fbs</code></td><td>OpType 枚举 + OpParameter union（新增 Op 需修改）</td></tr>
+</table>
+
+<pre>// Op 注册三步:
+// 1. MNN.fbs: 定义 OpType + OpParameter
+// 2. source/shape/: REGISTER_SHAPE(OpType_XXX, XxxSizeComputer)
+// 3. source/backend/cpu/: REGISTER_CPU_OP_CREATOR(CPUXXX, OpType_XXX)</pre>
+
+<h3>4. KV Cache 管理</h3>
+<table>
+<tr><th>文件</th><th>说明</th></tr>
+<tr><td><code>source/backend/cpu/CPUKVCacheManager.cpp</code></td><td>CPU KV Cache 管理器（分配/回收/拼接）</td></tr>
+<tr><td><code>source/core/KVCache.hpp</code></td><td>KVCache 数据结构（past_key/past_value 存储）</td></tr>
+</table>
+
+<h3>5. RoPE（旋转位置编码）</h3>
+<table>
+<tr><th>文件</th><th>说明</th></tr>
+<tr><td><code>source/backend/cpu/arm/CommonOptFunctionNeon.cpp</code></td><td>包含 RoPE 的 NEON 实现</td></tr>
+<tr><td><code>transformers/llm/export/utils/transformers.py</code></td><td>Python 端 RoPE 生成逻辑</td></tr>
+</table>
+
+<h2>Transformer Block 架构</h2>
+<pre>输入 [batch, seq_len, dim]
+  │
+  ├─ Attention Block:
+  │    ├─ linear QKV ──→ Q, K, V [batch, head, seq, dim_head]
+  │    ├─ RoPE(Q), RoPE(K)                     (位置编码)
+  │    ├─ KVCache: concat past + current       (自回归推理)
+  │    ├─ Q @ K^T / sqrt(d) → Softmax → × V    (Scaled Dot-Product Attention)
+  │    └─ linear Output
+  │
+  ├─ Add & LayerNorm  (残差连接)
+  │
+  ├─ FFN Block:
+  │    ├─ linear↑ (gate + up) → SiLU
+  │    └─ linear↓
+  │
+  └─ Add & LayerNorm</pre>
+
+<h2>面试重点</h2>
+<div class="qa">
+<div class="q">MNN 中如何新增一个 Op？</div>
+<div class="a">四步：① MNN.fbs 定义 OpType + OpParameter ② source/shape/ 注册 SizeComputer ③ source/backend/cpu/ 注册 CPU Creator（REGISTER_CPU_OP_CREATOR）④ 实现 Execution onResize + onExecute。</div>
+</div>
+<div class="qa">
+<div class="q">KV Cache 的作用和实现？</div>
+<div class="a">自回归推理时，之前 token 的 K/V 已算过不需要重算。KVCache 把历史 K/V 缓存起来，每步只需算新 token 的 QKV、attention 时 concat 历史 K/V。内存随序列长度线性增长。</div>
+</div>
+<div class="qa">
+<div class="q">Prefill vs Decode 两阶段？</div>
+<div class="a">Prefill：一次性处理 prompt 的所有 token（并行），建立 KV Cache。Decode：逐 token 自回归生成（串行），每步只算新 token + 更新 KV Cache。</div>
+</div>
+<div class="qa">
+<div class="q">Attention 的 FLOPs 如何计算？</div>
+<div class="a">Q@K^T: batch×head×seq²×dim_head；Softmax: batch×head×seq²；×V: batch×head×seq²×dim_head。核心是 O(seq²) 的 QK 矩阵乘，长序列时成为瓶颈。</div>
+</div>
+
+<h2>学习路径建议</h2>
+<ol>
+  <li>Op 注册模式（MNN.fbs → REGISTER_SHAPE → REGISTER_CPU_OP_CREATOR → Execution）</li>
+  <li>CPUAttention 实现（QKV 投影 → Scale Dot-Product → Output 投影）</li>
+  <li>LayerNorm / Softmax / Reduction / BinaryOp 逐个分析</li>
+  <li>KV Cache 管理机制（CPUKVCacheManager）</li>
+  <li>RoPE 的位置编码原理与 NEON 优化</li>
+</ol>
+
+<div class="footer">2026-06-05</div>
+</div>
+</body>
+</html>

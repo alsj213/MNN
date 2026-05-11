@@ -1,0 +1,18 @@
+sequenceDiagram
+    actor 用户
+    participant MNN
+
+    用户->>MNN: 1. createFromFile("model.mnn")
+    Note right of MNN: 模型加载<br/>解析文件结构<br/>FlatBuffers 零拷贝
+
+    用户->>MNN: 2. createSession(config)
+    Note right of MNN: Session 创建<br/>创建 Runtime (CPU/GPU)<br/>Schedule 切分子图
+
+    用户->>MNN: 3. resizeSession(session)
+    Note right of MNN: 图优化<br/>形状推导 (每层输出尺寸)<br/>算子分解 (Conv→MatMul)<br/>内存分配 (引用计数复用)
+
+    用户->>MNN: 4. runSession(session)
+    Note right of MNN: 推理执行<br/>输入数据拷贝到后端<br/>逐算子 onExecute()
+
+    用户->>MNN: 5. getSessionOutput(session)
+    Note right of MNN: 读取结果<br/>取出输出 Tensor<br/>获得分类/检测结果

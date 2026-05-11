@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>LayerNorm/Softmax/RoPE — MNN 学习</title><link rel="stylesheet" href="../../../mnn.css"></head>
+<body>
+<div class="study-container">
+<div class="nav"><a href="../index.html">← Transformer 总览</a><span>03 / LayerNorm · Softmax · RoPE</span></div>
+<h1>LayerNorm · Softmax · RoPE — Transformer 核心算子</h1>
+<p class="status-tag now">深度完成</p>
+
+<h2>LayerNorm (CPULayerNorm.cpp, 180 行)</h2>
+
+<h3>公式</h3>
+<pre>RMSNorm:  y = x / sqrt(mean(x²) + ε) × γ      (只归一化方差, 无均值中心化)
+LayerNorm: y = (x - μ) / √(σ² + ε) × γ + β    (完整归一化)
+
+MNN 用 MNNNorm 统一实现两种模式 (mRMSNorm 标志)</pre>
+
+<h3>NEON 均值计算</h3>
+<pre>// MNNAccumulateSequenceNumber (CommonOptFunction.cpp:1344)
+// 4 路 vaddq_f32 累加器, 每轮处理 16 个 float
+
+v0 = vld1q_f32(&src[i+0])      // 加载 4 个
+v1 = vld1q_f32(&src[i+4])
+v2 = vld1q_f32(&src[i+8])
+v3 = vld1q_f32(&src[i+12])
+sum0 = vaddq_f32(sum0, v0)     // 累加
+sum1 = vaddq_f32(sum1, v1)
+// ... 循环
+vaddvq_f32 水平归约 → 最终均值</pre>
+
+<h3>NEON 归一化 + Scale</h3>
+<pre>// 16 个 float 一批:
+v0 = vld1q(&src[j+0])
+v0 = vsubq_f32(v0, vmean)          // 中心化: x - μ
+v0 = vmulq_f32(v0, vvar)           // 缩放: × 1/√(σ²+ε)
+s0 = vmlaq_f32(b0, s0, g0)         // dst = β + normalized × γ (FMA)
+
+// 4 条 NEON 指令完成 4 个元素的完整 LayerNorm
+// 其中 FMA 融合了 ·γ + +β 两步</pre>
+
+<h3>RMSNorm vs LayerNorm 性能</h3>
+<pre>RMSNorm: 省去均值计算 → ~30% 少算
+  只需要: sum(x²) → 1/√(sum/N+ε) → x × variable × γ
+  LLM 多用 RMSNorm (LLaMA/Qwen/DeepSeek)
+
+LayerNorm: 需要均值 + 方差
+  先算 μ → 再算 σ² → (x-μ)/σ × γ + β</pre>
+
+<h2>Softmax (CPUSoftmax.cpp, 360 行)</h2>
+
+<h3>标准 Softmax</h3>
+<pre>// _MNNSoftmax — 单轴 softmax
+
+1. Max:    MNNMaxFloat(src) → NEON vmaxq 归约
+2. Exp:    MNNExp(dst, expOffset={0, -Max}) → exp(x - Max)
+           同时累加到 expOffset[3] = Σexp(x-Max)
+3. Scale:  mulFunction(dst, dst, &sumDiv) → dst /= sum
+
+// expOffset = {0, 1, -Max, 0}
+// expOffset[3] 在 MNNExp 内部被更新为 sum</pre>
+
+<h3>多轴 Softmax</h3>
+<pre>// _softmaxCommon — 对指定轴做 softmax
+for 每个 batch:
+  1. maxFunction → 沿 axis 找最大值
+  2. subFunction → dst = src - max
+  3. MNNExp     → dst = exp(dst)
+  4. addFunction → 沿 axis 求和
+  5. recFunction × mulFunction → dst /= sum</pre>
+
+<h2>RoPE (旋转位置编码)</h2>
+
+<h3>MNN 中的 RoPE 不是独立 Op</h3>
+<pre>★ RoPE 是图级构造, 不是融合 kernel!
+
+模型 ONNX 图中:
+  position_ids → Sin/Cos → Slice → half1, half2
+  Q/K → split → [x1,x2] × cos ± [rotate(x2),rotate(x1)] × sin
+  → 用标准 ONNX 算子表达 (Sin, Cos, Mul, Add, Concat, Slice)
+
+MNN 直接执行这些标准 Op, 无需专门 RoPE kernel</pre>
+
+<h3>位置 ID 生成 (llm.cpp)</h3>
+<pre>// Prefill: 为每个 token 生成递增位置
+for i in [0..seq_len]:  ptr[i] = i + mContext->all_seq_len
+
+// Decode: 只有 1 个 token
+ptr[0] = mContext->all_seq_len   // 使用全局累积位置
+
+// M-RoPE (多模态): gen_position_ids 输出 [3, seq_len]
+// 3 个独立维度: T(文本), H(高度), W(宽度)</pre>
+
+<h3>rotate_half 技巧 (数学层面)</h3>
+<pre>给定向量 x = [x₀, x₁, ..., x_d₋₁]:
+  x_left  = [x₀, x₁, ..., x_{d/2-1}]
+  x_right = [x_{d/2}, ..., x_{d-1}]
+  rotated_x = [-x_{d/2}, ..., -x_{d-1}, x₀, ..., x_{d/2-1}]
+
+RoPE(dim i):
+  cos_i = cos(pos × θ_i),  sin_i = sin(pos × θ_i)
+  x'_i = x_i × cos_i + rotated_x_i × sin_i
+
+MNN 图用: Mul/Add 完成上述公式, 无专用汇编</pre>
+
+<h2>关键文件</h2>
+<ul>
+  <li><code>source/backend/cpu/CPULayerNorm.cpp</code> — LayerNorm/RMSNorm (180 行)</li>
+  <li><code>source/backend/cpu/compute/CommonOptFunction.cpp:3279</code> — MNNNorm (NEON 实现)</li>
+  <li><code>source/backend/cpu/CPUSoftmax.cpp</code> — 标准 + 多轴 softmax</li>
+  <li><code>source/backend/cpu/arm/CommonOptFunctionNeon.cpp:407</code> — MNNExp (exp 多项式近似)</li>
+  <li><code>source/backend/cpu/compute/CommonOptFunction.cpp:2890</code> — Attention MNNSoftmax</li>
+  <li><code>transformers/llm/engine/src/llm.cpp:1470</code> — gen_position_ids (RoPE 位置生成)</li>
+  <li><code>transformers/llm/engine/src/omni.cpp:978</code> — M-RoPE (多模态位置 ID)</li>
+</ul>
+
+<div class="footer">2026-06-08</div>
+</div>
+</body>
+</html>

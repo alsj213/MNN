@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Op 注册模式 — MNN 学习</title><link rel="stylesheet" href="../../../mnn.css"></head>
+<body>
+<div class="study-container">
+<div class="nav"><a href="../index.html">← Transformer 总览</a><span>01 / Op 注册模式</span></div>
+<h1>Op 注册模式 — 从 Schema 到 Execution 的四层机制</h1>
+<p class="status-tag now">深度完成</p>
+
+<h2>四层注册架构</h2>
+<pre>MNN.fbs (Schema)  →  SizeComputer (形状推导)  →  GeometryComputer (算子分解)  →  Execution (后端计算)
+    │                        │                              │                            │
+ OpType 枚举              REGISTER_SHAPE               REGISTER_GEOMETRY         REGISTER_CPU_OP_CREATOR
+ OpParameter union        运行时 O(1) 查表             编译期子命令生成           工厂模式多态创建</pre>
+
+<h2>第一层: Schema 定义 (MNN.fbs)</h2>
+<pre>// MNN.fbs — OpType 枚举, OpParameter union
+enum OpType : int {
+    AbsVal = 0, Convolution = 29, ConvolutionDepthwise = 30,
+    BinaryOp = 35, MatMul = 50, Pooling = 74,
+    Raster = 128, Plugin = 256, Attention = 299, LayerNorm = 603, ...
+}
+
+table Op {
+    type: OpType;           // ← 调度总开关
+    main: OpParameter;      // ← union, 指向具体参数表
+    inputIndexes: [int];
+    outputIndexes: [int];
+}
+
+union OpParameter {
+    Convolution2D, Pool, Plugin, Relu, LayerNorm, AttentionParam, ...
+}
+
+// 新增 Op: 先在 OpType 加枚举值, 再在 OpParameter 加参数表</pre>
+
+<h2>第二层: SizeComputer — 形状推导</h2>
+<pre>// SizeComputer.hpp:134
+#define REGISTER_SHAPE(name, op)                      \
+    void ___##name##__##op##__() {                    \
+        name* _temp = new name;                        \
+        SizeComputerSuite::get()->insert(_temp, op);  \
+    }
+// SizeComputerSuite 内部: vector&lt;SizeComputer*&gt; 数组, 下标 = OpType
+
+// 示例: ShapeScale.cpp
+class ScaleSizeComputer : public SizeComputer {
+    virtual bool onComputeSize(...) override {
+        // 输出形状 = 输入形状 (Scale 不改变维度)
+        TensorUtils::copyShape(inputs[0], outputs[0], true);
+        return true;
+    }
+};
+REGISTER_SHAPE(ScaleSizeComputer, OpType_Scale);
+
+// 调用: SizeComputerSuite::search(OpType_Scale) → ScaleSizeComputer*</pre>
+
+<h2>第三层: GeometryComputer — 算子分解</h2>
+<pre>// GeometryComputer.hpp:85
+#define REGISTER_GEOMETRY(f, c)       \
+    extern void ___##f##__##c##__() { \
+        c();                          \
+    }
+// c() 内部调用 GeometryComputer::registerGeometryComputer(comp, {types})
+
+// 示例: GeometryBinary.cpp
+static void _create() {
+    auto comp = make_shared&lt;GeometryBinary&gt;();
+    GeometryComputer::registerGeometryComputer(comp, {OpType_BinaryOp});
+}
+REGISTER_GEOMETRY(GeometryBinary, _create);
+
+// 如果找不到 GeometryComputer → DefaultGeometryComputer
+// 直接将 Op 包裹成 1 个 Command, 不做分解</pre>
+
+<h2>第四层: Execution — CPU 后端计算</h2>
+<pre>// CPUBackend.hpp:218
+#define REGISTER_CPU_OP_CREATOR(name, opType)     \
+    void ___##name##__##opType##__() {            \
+        static name _temp;                         \
+        CPUBackend::addCreator(opType, &_temp);   \
+    }
+// CPUBackend 内部: map&lt;OpType, Creator*&gt; gCreator
+
+// Creator 接口 (CPUBackend.hpp:148):
+class Creator {
+    virtual Execution* onCreate(inputs, outputs, op, backend) = 0;
+};
+
+// 示例: CPUScale.cpp
+class CPUScaleCreator : public CPUBackend::Creator {
+    Execution* onCreate(inputs, outputs, op, backend) override {
+        return new CPUScale(op, backend);
+    }
+};
+REGISTER_CPU_OP_CREATOR(CPUScaleCreator, OpType_Scale);
+
+// 调用: CPUBackend::onCreate(inputs, outputs, op)
+//   → gCreator[OpType_Scale] → Creator::onCreate → new CPUScale</pre>
+
+<h2>Execution 抽象基类</h2>
+<pre>// Execution.hpp:24
+class Execution {
+public:
+    virtual ErrorCode onResize(inputs, outputs) { return NO_ERROR; }  // 可选
+    virtual ErrorCode onExecute(inputs, outputs) = 0;                 // 纯虚
+    Backend* backend() const { return mBackEnd; }
+};
+
+// 每个 Op 的 Execution 实现 onResize + onExecute
+// onResize: 分配临时 buffer, 确定线程分片, 选函数指针
+// onExecute: 执行实际计算</pre>
+
+<h2>注册总流程 (运行时, 非静态初始化)</h2>
+<pre>registerBackend()
+  │
+  ├─ registerCPURuntimeCreator()
+  │    ├─ CPUBackend::initCreatorMap()  →  new map&lt;OpType, Creator*&gt;
+  │    └─ registerCPUOps()              →  遍历所有 REGISTER_CPU_OP_CREATOR 函数
+  │
+  ├─ SizeComputerSuite::init()
+  │    └─ registerShapeOps()            →  遍历所有 REGISTER_SHAPE 函数
+  │
+  └─ GeometryComputer::init()
+       └─ registerGeometryOps()         →  遍历所有 REGISTER_GEOMETRY 函数
+
+★ 全部显式调用链, 无 static 构造函数魔法
+★ 代码生成脚本扫描源码找 REGISTER_* 宏, 生成 *Register.cpp 文件</pre>
+
+<h2>新增一个 Op 的四步</h2>
+<pre>以 OpType_Scale 为例:
+
+1. MNN.fbs:      OpType 枚举加 Scale, OpParameter union 加 Scale table
+2. ShapeScale.cpp:   ScaleSizeComputer + REGISTER_SHAPE
+3. (可选) GeometryScale.cpp:  GeometryScale + REGISTER_GEOMETRY
+4. CPUScale.cpp:    CPUScaleCreator + REGISTER_CPU_OP_CREATOR + CPUScale Execution</pre>
+
+<h2>关键文件</h2>
+<ul>
+  <li><code>schema/default/MNN.fbs:17</code> — OpType 枚举 (600+ 个)</li>
+  <li><code>schema/default/MNN.fbs:345</code> — OpParameter union</li>
+  <li><code>source/shape/SizeComputer.hpp:134</code> — REGISTER_SHAPE 宏</li>
+  <li><code>source/shape/SizeComputer.cpp:26</code> — SizeComputerSuite::init</li>
+  <li><code>source/geometry/GeometryComputer.hpp:85</code> — REGISTER_GEOMETRY 宏</li>
+  <li><code>source/backend/cpu/CPUBackend.hpp:218</code> — REGISTER_CPU_OP_CREATOR 宏</li>
+  <li><code>source/backend/cpu/CPUBackend.cpp:722</code> — CPUBackend::onCreate (工厂查找)</li>
+  <li><code>source/core/Execution.hpp:24</code> — Execution 基类 (onResize/onExecute)</li>
+  <li><code>source/backend/cpu/CPUOPRegister.cpp</code> — registerCPUOps (注册汇总)</li>
+</ul>
+
+<div class="footer">2026-06-08</div>
+</div>
+</body>
+</html>

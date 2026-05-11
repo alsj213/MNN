@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>resize 图优化 — MNN 学习</title><link rel="stylesheet" href="../../../mnn.css"></head>
+<body>
+<div class="study-container">
+<div class="nav"><a href="../../../mnn.html">← 返回总览</a><span>03 / resize 图优化</span></div>
+<h1>resize / 图优化 — Geometry 计算</h1>
+<p class="status-tag now">学习中</p>
+
+<h2>Session::resize() — 两个阶段</h2>
+<pre>Session::resize()
+  │
+  ├─ mNeedResize = true?           第一次或 shape 变了
+  │   └─ Pipeline::encode()        "设计图纸"
+  │       形状推导 + Op 分解 + 量化传播
+  │
+  └─ mNeedMalloc = true?           每次 resize 都执行
+      └─ Pipeline::allocMemory()   "分配资源"
+          创建 Execution + 分配内存</pre>
+
+<h2>Pipeline::encode 两种路径</h2>
+
+<h3>路径 A：静态图（!needComputeGeometry）</h3>
+<pre>Pipeline::encode():
+  if (!needComputeGeometry):
+    for each OpCacheInfo:
+      复制 Op 到 Command（op, inputs, outputs）
+      存入 executeBuffer.command</pre>
+
+<h3>路径 B：需要 Geometry（默认）</h3>
+<pre>Pipeline::encode():
+  if (needComputeGeometry):
+    ① 清空 Backend 缓存
+    ② shapeComputeAndGeometryTransform()
+         ├── Phase 1: 形状推导 (Size Compute)
+         └── Phase 2: Geometry 变换 (Op 分解)
+    ③ 量化传播 + Cast 插入（量化模型）
+    ④ DebugInfo（回调模式）</pre>
+
+<h2>Phase 1：形状推导</h2>
+
+<h3>主循环（对每个 OpCacheInfo）</h3>
+<pre>for (int i=0; i&lt;infos.size(); ++i) {
+    auto& info = infos[i];
+
+    // Step 1：重置输出 Tensor 状态
+    //   - 引用计数 &gt;1（被共享） → 重新创建描述
+    //   - 其他 → 清空 backend 和 mem
+    for (auto t : info.outputs) {
+        setBackend(nullptr);
+        mem = nullptr;
+    }
+
+    // Step 2：检查 shape 是否变化
+    bool needCompute = !info.computeCache.match(info.inputs, compared);
+
+    // Step 3：变了 → 调用 SizeComputer 算输出 shape
+    if (needCompute) {
+        SizeComputer::computeOutputSize(op, inputs, outputs);
+        //   dispatch 链：
+        //     computer = SizeComputerSuite::search(op-&gt;type())
+        //     computer-&gt;onComputeSize(op, inputs, outputs)
+
+        adjustTensorForCompability(outputs);
+        info.computeCache.insert(inputs);     // 缓存当前 shape
+    }
+
+    // Step 4：CONSTANT Op → 用 CPU 直接算出常量值
+    if (info.type == CONSTANT && needCompute) {
+        GeometryComputer::search()-&gt;onCompute()
+        backupBackend 分配内存 + onExecute()
+    }
+}</pre>
+
+<h3>SizeComputer 调用链</h3>
+<pre>SizeComputer::computeOutputSize(op, inputs, outputs)
+  │
+  ├─ 特殊处理：Blob → computeShapeForBlob()
+  ├─ 特殊处理：While/If → 从 LoopParam 读 shape
+  ├─ 检查输入是否有 -1 维度
+  │
+  ├─ 【通用分支】查注册表
+  │    computer = SizeComputerSuite::search(op-&gt;type())
+  │              = mRegistry[OpType_Convolution]
+  │    computer-&gt;onComputeSize(op, inputs, outputs)
+  │
+  └─ 没找到 SizeComputer → 默认拷贝 inputs[0] shape</pre>
+
+<h3>Conv 形状推导示例</h3>
+<pre>ConvolutionSizeComputer::onComputeSize(op, inputs, outputs) {
+    kX = kernelX, kY = kernelY, strideX, strideY
+
+    SAME:  oh = ceil(input_h / stride_h)
+    VALID: oh = ceil((input_h - kernel_h + 1) / stride_h)
+    CAFFE: oh = (input_h + 2*pad_h - kernel_h) / stride_h + 1
+
+    outputs[0]-&gt;dim = [batch, outputCount, oh, ow]
+}</pre>
+
+<h3>常量折叠（buildConstantTensors）</h3>
+<pre>buildConstantTensors(infos):
+  for each OpCacheInfo:
+    if 所有输入都是 CONSTANT:
+      → 标记 CONSTANT，运行时跳过
+  for each OpCacheInfo:
+    if needInputContent(op) 需要数据才能算 shape:
+      → 标记输入为 CONSTANT</pre>
+
+<h2>Phase 2：Geometry 变换</h2>
+
+<h3>三种拆分规则</h3>
+
+<p><b>① 计算密集型 → Im2Col + MatMul</b></p>
+<pre>Conv2D      → Im2Col + MatMul + Col2Im
+ConvTranspose → Im2Col + MatMul
+FullyConnected → Reshape + MatMul
+BatchMatMul → MatMul（多维转二维）
+// 目的：复用 GEMM 优化</pre>
+
+<p><b>② 内存布局型 → Region（不产生新 Command）</b></p>
+<pre>Concat → 填 regions[]（各输入拼到不同偏移）
+Slice  → 填 regions[]（从输入截取一段）
+Pad    → 填 regions[]（输入写到输出中间）
+// 不做数学运算，只描述"谁写到哪"</pre>
+
+<p><b>③ 逐元素型 → 透传或拆 BinaryOp</b></p>
+<pre>ReLU      → 透传（本身已是基础 Op）
+BinaryOp  → 透传（Add/Mul/Sub）
+BatchNorm → Mul + Add
+// 后端直接实现 BinaryOp</pre>
+
+<h2>Region / Raster</h2>
+
+<h3>Region：数据搬运的描述</h3>
+<pre>struct Region {
+    View src;              // {offset, stride[3]}
+    View dst;              // {offset, stride[3]}
+    int32_t size[3];       // 三个维度长度
+    Tensor* origin;        // 源 tensor
+};</pre>
+<p>Region 描述"从 <code>origin[src.offset : src.stride]</code> 范围 size，搬到 <code>dst.offset : dst.stride</code>"。offset 和 stride 都是<b>元素单位</b>，代码中乘以 bytes 转字节。</p>
+
+<h3>Raster：执行 Region 的 Op</h3>
+<pre>ErrorCode CPURaster::onExecute(inputs, outputs) {
+    for (auto& slice : output-&gt;regions) {
+        srcPtr = origin-&gt;host() + slice.src.offset * bytes;
+        dstPtr = output-&gt;host() + slice.dst.offset * bytes;
+        _blit(slice, bytes, srcPtr, dstPtr);  // 三维循环 memcpy
+    }
+}</pre>
+
+<h2>Pipeline::allocMemory</h2>
+
+<pre>allocMemory(firstMalloc, forbidReplace)
+  │
+  ├─ ① 自动调优（非 CPU 后端）
+  │    onMeasure() 评估初始化成本
+  │    高成本 Op → 异步 tuning，先 fallback 到 CPU
+  │
+  ├─ ② _createExecutions()       【Op → Execution 对象】
+  │
+  ├─ ③ _SetTensorBackend()       【标记 Tensor 所在后端】
+  │
+  ├─ ④ _InsertCopy()             【跨后端插入 Wrap Copy】
+  │
+  └─ ⑤ _allocForTensor()         【引用计数内存分配】</pre>
+
+<h3>_createExecutions — 4 层优先级</h3>
+<pre>for 每个 Command:
+    ① executionCache 缓存（上次 resize 的）
+    ② KV Cache 克隆（LLM Attention 共享）
+    ③ primary Backend 创建（GPU/OpenCL/Metal）
+    ④ backup CPU 兜底
+
+    都不行 → return NOT_SUPPORT</pre>
+
+<h3>_allocForTensor — 引用计数内存复用</h3>
+<pre>// Step 1：统计 useCount
+for 每个 Command:
+  for 每个 workInputs: des-&gt;useCount += 1
+
+// Step 2：分配 + 释放
+for 每个 Command:
+  _allocTensor(inputs)   // 仅 mem==null 才分配
+  _allocTensor(outputs)
+  execution-&gt;onResize()
+  _releaseTensor(inputs) // useCount--，归零释放
+
+// _allocTensor：mem 已有→复用，mem 为空→onAcquireBuffer</pre>
+
+<h2>完整 resize 流程图</h2>
+<pre>resizeSession(session)
+  │
+  ▼
+Session::resize()
+  │
+  ├─ encode()
+  │    ├─ 重置 Tensor
+  │    ├─ SizeComputer 形状推导
+  │    ├─ buildConstantTensors 常量传播
+  │    ├─ GeometryComputer Op 分解
+  │    │    ├─ 计算型 → Im2Col+MatMul
+  │    │    ├─ 内存型 → Region → Raster
+  │    │    └─ 逐元素 → 透传
+  │    └─ 量化传播 + Cast
+  │
+  └─ allocMemory()
+       ├─ _createExecutions: ①cache ②KV ③primary ④backup
+       ├─ _SetTensorBackend: 标记后端
+       ├─ _InsertCopy: 跨后端 Wrap
+       └─ _allocForTensor: 引用计数内存分配</pre>
+
+<h2>关键文件</h2>
+<ul>
+  <li><code>source/core/Pipeline.cpp:202</code> — Pipeline::encode</li>
+  <li><code>source/core/Pipeline.cpp:538</code> — _createExecutions</li>
+  <li><code>source/core/Pipeline.cpp:951</code> — _allocForTensor</li>
+  <li><code>source/core/Session.cpp:272</code> — Session::resize</li>
+  <li><code>source/geometry/GeometryComputerUtils.cpp:142</code> — shapeComputeAndGeometryTransform</li>
+  <li><code>source/shape/SizeComputer.cpp:120</code> — computeOutputSize dispatch</li>
+  <li><code>source/shape/ShapeConvolution.cpp</code> — Conv 形状推导</li>
+  <li><code>source/geometry/GeometryConv2D.cpp</code> — Conv 分解</li>
+  <li><code>source/backend/cpu/CPURaster.cpp</code> — Raster onExecute</li>
+</ul>
+
+<h2>面试重点</h2>
+
+<div class="qa">
+<div class="q">encode 和 execute 什么区别？</div>
+<div class="a"><b>encode</b> = 编译期，形状推导 + Op 分解 + 内存规划。只在 resize 时调用。<b>execute</b> = 运行期，逐条执行 Command。每次 runSession 都调用。encode 产出 CommandBuffer，execute 消费 CommandBuffer。</div>
+</div>
+
+<div class="qa">
+<div class="q">Session::resize 为什么分 encode 和 allocMemory 两步？</div>
+<div class="a">encode 不依赖硬件，纯数学计算 + 算法分解；allocMemory 依赖具体后端，需要创建 Execution 和分配内存。shape 没变时跳过 encode 只走 allocMemory，省掉不必要的形状推导和 Op 分解。</div>
+</div>
+
+<div class="qa">
+<div class="q">SizeComputer 的调用链？</div>
+<div class="a"><code>encode → shapeComputeAndGeometryTransform → SizeComputer::computeOutputSize → SizeComputerSuite::search(op-&gt;type()) → mRegistry[op-&gt;type()] → computer-&gt;onComputeSize()</code>。每个 OpType 对应一个 SizeComputer，本质是数学公式。</div>
+</div>
+
+<div class="qa">
+<div class="q">Geometry 拆分规则是什么？</div>
+<div class="a">三类：<b>计算密集型</b>拆 Im2Col+MatMul 复用 GEMM；<b>内存布局型</b>转 Region 由 Raster 统一执行；<b>逐元素型</b>透传。后端只要实现 MatMul + BinaryOp + Raster 三种基础能力。</div>
+</div>
+
+<div class="qa">
+<div class="q">Region 和 Raster 分别是什么？</div>
+<div class="a"><b>Region</b> = "图纸"，描述数据从源到目标的带步长拷贝。Geometry 阶段填好。<b>Raster</b> = "施工队"，运行时遍历 Region 执行 memcpy。offset/stride 都是元素单位。</div>
+</div>
+
+<div class="qa">
+<div class="q">_createExecutions 的优先级？</div>
+<div class="a">4 层：① executionCache 缓存 → ② KV Cache Attention 克隆 → ③ primary Backend 创建 → ④ backup CPU 兜底。全失败报 NOT_SUPPORT。</div>
+</div>
+
+<div class="qa">
+<div class="q">allocMemory 每次都开辟新内存吗？</div>
+<div class="a"><b>不一定。</b>首次全部分配；shape 没变跳过；shape 变了清空重分配。引用计数管理：useCount 归零立即释放供复用。是静态内存规划，不是动态 malloc/free。</div>
+</div>
+
+<div class="qa">
+<div class="q">Region 为什么能表达这么多算子？</div>
+<div class="a">Concat/Slice/Pad/Crop 本质都是数据重排不做数学计算。差异只是 offset/stride 参数不同，没有本质区别。Region 用 6 个整数就能描述任意 N 维数据子集拷贝。</div>
+</div>
+
+
+<h2>深度总结</h2>
+<div style="font-size:13px; display:grid; grid-template-columns:1fr 1fr; gap:6px 24px; margin:8px 0 20px 0;">
+  <div>encode/allocMemory 两阶段分离（数学 vs 硬件）</div>
+  <div>静态/动态模型分路径（needComputeGeometry）</div>
+  <div>OpResizeCache 增量检测（match/insert/close）</div>
+  <div>SizeComputer 形状推导（70+ 子类，数学公式）</div>
+  <div>SizeComputerSuite 注册表（search O(1) 哈希查找）</div>
+  <div>GeometryComputer Op 分解（Conv→Im2Col+MatMul 等）</div>
+  <div>常量折叠：encode 阶段 CPU 执行 + STATIC 内存写入</div>
+  <div>CONTENT_NOT_CHANGE 脏标记链（避免重复计算）</div>
+  <div>_createExecutions 4 层优先级（cache→KV→primary→CPU）</div>
+  <div>_SetTensorBackend 标记 Tensor 归属 Backend</div>
+  <div>_InsertCopy 跨后端 Wrap（workInputs 赋值点）</div>
+  <div>_allocForTensor 引用计数内存复用（useCount）</div>
+  <div>三种内存类型（STATIC / DYNAMIC_SEPERATE / DYNAMIC）</div>
+  <div>opFuse 编译期 GPU 逐元素融合（MNN_BUILD_CODEGEN）</div>
+  <div>fixResizeCache group 固定内存（避免重复分配）</div>
+  <div>自动调优：异步 GPU tuning + CPU fallback</div>
+</div>
+
+<div class="footer">2026-05-18</div>
+</div>
+</body>
+</html>

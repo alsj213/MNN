@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>INT8 量化卷积 — MNN 学习</title><link rel="stylesheet" href="../../../mnn.css"></head>
+<body>
+<div class="study-container">
+<div class="nav"><a href="../index.html">← CNN 总览</a><span>04 / INT8 量化卷积</span></div>
+<h1>INT8 量化卷积 — 精度换速度</h1>
+<p class="status-tag now">深度完成</p>
+
+<h2>为什么 INT8 能快 2-4×</h2>
+<table>
+<tr><th>因素</th><th>FP32</th><th>INT8</th><th>加速比</th></tr>
+<tr><td>内存带宽</td><td>4 字节/element</td><td>1 字节/element</td><td>~4× (带宽密集层)</td></tr>
+<tr><td>SIMD 吞吐</td><td>1 FP32 FMA/cycle/lane</td><td>2~4 INT8 MAC/cycle/lane (SDOT/I8MM)</td><td>2~4×</td></tr>
+<tr><td>Cache 密度</td><td>4× tile 大小</td><td>1× tile 大小</td><td>更多 tile 放 L1</td></tr>
+</table>
+
+<h2>三种量化方案</h2>
+<table>
+<tr><th>方案</th><th>激活量化</th><th>权重量化</th><th>使用场景</th></tr>
+<tr><td><b>IDST</b></td><td>单 scale (per-tensor)</td><td>单 scale</td><td>旧 MNN 量化模型</td></tr>
+<tr><td><b>TF-Style</b></td><td>uint8 零点式</td><td>per-channel</td><td>TensorFlow Lite 模型</td></tr>
+<tr><td><b>对称 (Symmetric)</b></td><td>int8, zero=0</td><td>per-channel scale</td><td>MNN 标准量化</td></tr>
+<tr><td><b>动态 (Dynamic)</b></td><td>运行时算 scale</td><td>离线量化/FP32</td><td>LLM 推理</td></tr>
+</table>
+
+<h2>量化公式</h2>
+<pre>// 标准对称量化 (MNN 默认)
+int8_value = round(FP32_value / scale)       // scale 是 FP32
+FP32_value = int8_value × scale               // 去量化
+
+// TF 风格 (uint8, 零点 ≠ 0)
+float = (uint8_value - zero_point) × scale
+
+// 去量化在 GEMM 内部的公式 (ConvInt8TiledExecutor):
+value = dstInt32 × scale_weight × inputScale    // GEMM 累加结果 × 缩放
+      + srcSum × weightBias                       // 输入和补偿项
+      + inputBias × weightKernelSum               // 非对称激活偏置
+      + bias                                       // 卷积偏置</pre>
+
+<h2>INT8 GEMM Tile 大小 (架构相关)</h2>
+<pre>// Int8FunctionsOpt.cpp
+
+  架构              UNIT(HP)  SRC_UNIT(LP)  DST_XUNIT(EP)
+  ARM NEON          4         16             4
+  ARM SDOT (8.2)    8         4             12
+  ARM I8MM (8.6)    8         8             10
+  SME2 (HP32)       32        4             16
+  SME2 (HP128)      64        4             16     ← LLM decode 专用
+
+// 对应: C[EP × HP] = A[EP × SRC_UNIT] × B[SRC_UNIT × HP]
+// 一次 micro-kernel 处理 EP×HP 个输出</pre>
+
+<h2>ConvInt8TiledExecutor 执行流程</h2>
+<pre>// ConvInt8TiledExecutor.cpp:1531+
+
+动态量化路径 (MNN_LOW_MEMORY):
+  ① BatchAsyDynamicQuant: 运行时算 min/max → scale/zero
+  ② MNNFloat2Int8: FP32 输入 → INT8
+
+  ③ Im2Col: MNNPackC4Int8ForMatMul_A → [blockL, EP, SRC_UNIT]
+  ④ MNNSumByAxisLForMatmul_A: 算 Σ(input) × inputScale (去量化补偿项)
+  ⑤ Int8GemmKernel:
+       for each output tile:
+         int32 accum += Σ(int8_src × int8_weight)
+         FP32 = accum × scale_w × scale_in + compensation + bias
+  ⑥ 可选: MNNFloat2Int8  → INT8 输出
+
+非动态路径 (离线量化):
+  输入已是 INT8, 跳过 ①②, 直接从 ③ 开始</pre>
+
+<h2>INT8 GEMM 内循环 (标量参考实现)</h2>
+<pre>// Int8FunctionsOpt.cpp:1531  MNNGemmInt8AddBiasScale_16x4_Unit
+
+for block in [0..blockNum]:                    // 分组量化, 每组独立 scale
+  for sz in [0..src_depth_quad]:
+    for j in [0..UNIT]:                         // 4 个输出通道
+      for i in [0..SRC_UNIT]:                  // 16 个输入通道
+        dstTemp[j] += (int32_t)src_z[i] × (int32_t)weight_j[i]
+
+  // 去量化:
+  for j in [0..UNIT]:
+    value = dstTemp[j] × scale_dz[j] × inputScale
+          + srcSum × weightBias_dz[j]     // 非对称补偿
+          + inputBias × weightKernelSum[j] // 零点补偿
+          + bias_dz[j]                     // 卷积偏置
+
+    if INT8 输出:
+      value = clamp(round(value), min, max)
+      dst[j] = (int8_t)value
+    else:
+      dst[j] = value  // FP32 输出</pre>
+
+<h2>权重打包格式</h2>
+<pre>// ConvInt8TiledExecutor.cpp:159
+// packWeightAndQuantInfo: [weight][scale][bias] 交错存储
+
+weight shape: [oc/UNIT, blockNum, blockK/SRC_UNIT, UNIT, SRC_UNIT]
+scale array:  [blockNum × ocUp4] FP32 值 (跟随 weight)
+bias array:   [blockNum × ocUp4] FP32 值
+
+// blockNum: 分组量化 block 数, 每组独立的 scale/bias
+// 好处: GEMM 内核一次 load 拿到 weight + scale + bias, 无间接引用</pre>
+
+<h2>INT8 Winograd 特殊处理</h2>
+<pre>// ConvInt8Winograd.cpp
+// 权重变换在 FP32 域做, 然后重新量化回 INT8
+
+1. dequant: FP32_weight = INT8_weight × quantScale
+2. G×g×G^T:   在 FP32 域做 Winograd 权重变换
+3. requant:    INT8_weight' = round(FP32_weight' / newScale)
+4. precompute: offset = Σ(quanData × (-inputPoint[a]))
+
+执行时:
+  输入变换: FP32 (与 FP32 Winograd 相同)
+  量化:      MNNFloat2Int8 (FP32 → INT8)
+  GEMM:      INT8 GEMM kernel
+  输出变换: FP32 (变换回 FP32 域)
+  后处理:    MNNMatrixAdd + MNNFloat2Int8</pre>
+
+<h2>关键文件</h2>
+<ul>
+  <li><code>source/backend/cpu/compute/ConvInt8TiledExecutor.cpp</code> — INT8 Im2Col+GEMM 完整实现 (2116 行)</li>
+  <li><code>source/backend/cpu/compute/Int8FunctionsOpt.cpp</code> — INT8 GEMM 核心 + MNNGetGemmUnit (2779 行)</li>
+  <li><code>source/backend/cpu/compute/ConvInt8Winograd.cpp</code> — INT8 Winograd</li>
+  <li><code>source/backend/cpu/compute/ConvolutionIntFactory.cpp</code> — INT8 工厂分发</li>
+  <li><code>source/backend/cpu/compute/IdstConvolutionInt8.cpp</code> — IDST 方案</li>
+  <li><code>source/backend/cpu/CPUTFQuantizedConv2D.cpp</code> — TF 式量化</li>
+  <li><code>source/backend/cpu/CPUDynamicQuant.cpp</code> — 动态量化</li>
+  <li><code>source/backend/cpu/compute/TurboQuant.hpp</code> — KVCache 3.5/4.5-bit 量化</li>
+</ul>
+
+<h2>面试重点</h2>
+<div class="qa">
+<div class="q">INT8 为什么能比 FP32 快？</div>
+<div class="a">三重因素: ① 内存带宽省 4× (每个 element 1B vs 4B) ② SIMD 每周期做 2~4 个 INT8 MAC (SDOT/I8MM) vs 1 个 FP32 FMA ③ L1 cache 多放 4× tile, 减少 L2 miss。</div>
+</div>
+<div class="qa">
+<div class="q">去量化 (dequant) 放在 GEMM 内部还是外部？</div>
+<div class="a">MNN 放在内部。GEMM 内核累加完后立即做 value = int32_accum × scale + compensation，这样输出直接是 FP32，不需要额外 pass。补偿项 (srcSum × weightBias) 是为了处理非对称量化的零点修正。</div>
+</div>
+<div class="qa">
+<div class="q">为什么需要 blockNum (分组量化)？</div>
+<div class="a">单个 scale 对于大权重矩阵精度损失大。把权重分成多个 block，每个 block 独立的 scale/bias，逐 block 累加后 Dequant → 精度更高。INT4 权重 (TurboQuant) 是极端情况: 每 32 个值一个 scale。</div>
+</div>
+<div class="qa">
+<div class="q">SDOT 和 I8MM 的区别？</div>
+<div class="a">SDOT (ARMv8.2): 4 个 INT8 点积/周期, UNIT=8 SRU=4。I8MM (ARMv8.6): 8 个 INT8 点积/周期, UNIT=8 SRU=8。I8MM 的 SRU 大一倍 (8 vs 4), 单次内循环计算量翻倍, ~2× 吞吐于 SDOT。</div>
+</div>
+
+<h2>深度总结</h2>
+<div class="checklist">
+<div class="checklist-item done">✅ 三种量化方案: IDST (单scale) / TF-Style (零点式) / Symmetric (per-channel)</div>
+<div class="checklist-item done">✅ INT8 GEMM = int8 乘 + int32 累加 + FP32 去量化 (在 kernel 内部完成)</div>
+<div class="checklist-item done">✅ 架构相关 Tile: SDOT(8,4,12) / I8MM(8,8,10) / SME2(32,4,16)</div>
+<div class="checklist-item done">✅ 权重打包: [weight][scale][bias] 交错, 一次 load 全拿到</div>
+<div class="checklist-item done">✅ 去量化补偿: srcSum×weightBias + inputBias×weightKernelSum (非对称量化)</div>
+<div class="checklist-item done">✅ INT8 Winograd: FP32 域变换 → 重新量化 → INT8 GEMM → FP32 逆变换</div>
+</div>
+
+<div class="footer">2026-06-08</div>
+</div>
+</body>
+</html>

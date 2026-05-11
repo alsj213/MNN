@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>KV Cache & Prefill/Decode — MNN 学习</title><link rel="stylesheet" href="../../../mnn.css"></head>
+<body>
+<div class="study-container">
+<div class="nav"><a href="../index.html">← Transformer 总览</a><span>04 / KV Cache & Prefill/Decode</span></div>
+<h1>KV Cache & Prefill/Decode — 自回归推理的核心</h1>
+<p class="status-tag now">深度完成</p>
+
+<h2>KVMeta 结构 — 缓存生命周期簿记</h2>
+<pre>// KVMeta.hpp:17
+struct KVMeta {
+    size_t block = 4096;     // 分配粒度
+    size_t previous = 0;     // 已缓存的 KV 位置总数
+    size_t remove = 0;       // 要从开头移除的位置数 (滚动窗口)
+    size_t add = 0;          // 要追加的新位置数
+    int* reserve = nullptr;  // 保留段 [n_reserve] 个 (start, len) 对
+    int n_reserve = 0;
+};
+
+synchronize():  previous = previous - remove + add
+// Prefill 后:  add=seq_len,  remove=0 → previous = seq_len
+// Decode 后:   add=1,       remove=0 → previous = seq_len + t
+// 滚动窗口:    add=1,       remove=1 → previous 不变</pre>
+
+<h2>KV Cache 内存布局 (按量化模式)</h2>
+<pre>未量化 Key:    [maxlen/hP, headDim/lP, hP, lP]
+  hP=8 (ARM64), 位置按 8 个一组打包, 512 个位置 → 64 个 hP 块
+
+未量化 Value:  [headDim/hP, maxlen/lP, hP, lP]
+  与 Key 维度对调! headDim 是外层, maxlen 是内层
+
+INT8 Key:      [maxlen/hP8, blockNum, (headDim/blockNum)/lP8, hP8, lP8]
+  额外 2×hP8×sizeof(float) 存储 scale + bias
+
+Flash Attention Value:
+  [kvHead, UP_DIV(maxlen, flashBlock), UP_DIV(headDim, hP),
+   UP_DIV(flashBlock, lP), hP, lP]
+  flashBlock = 64 (典型值)</pre>
+
+<h2>分配与扩展策略</h2>
+<pre>// CPUKVCacheManager.cpp:302 — onAlloc
+首次分配: mMaxLength = kv_seq_len + mExpandChunk (默认 +64)
+  → Tensor::createDevice + onAcquireBuffer(STATIC)
+
+// CPUKVCacheManager.cpp:477 — onRealloc
+kv_seq_len > mMaxLength 时触发:
+  mMaxLength = kv_seq_len + mExpandChunk
+  ① 分配更大的张量
+  ② memcpy 旧数据 → 新张量 (逐头复制)
+  ③ 新增长部分清零
+  ④ 释放旧张量 (shared_ptr 自动)
+
+// 滚动窗口 (onRealloc L477-618):
+  meta->remove 移除前导位置
+  meta->reserve[] 保留窗口内某些段
+  moveKV 模板重排保留位置到缓存开头</pre>
+
+<h2>磁盘 KV Cache 支持</h2>
+<pre>// expandKVCacheInDisk (L194-283)
+当总缓存大小超过内存限制时:
+  ① 复制 mmap 数据 → 临时 buffer
+  ② 取消映射, 重置文件大小, 重新 mmap
+  ③ 临时 buffer → 新 mmap 区域
+  ④ 释放临时 buffer</pre>
+
+<h2>ProcessKey/ProcessValue (写入缓存)</h2>
+<pre>// CPUKVCacheManager.cpp:699-803
+
+ProcessKey (未量化):
+  for each position i:
+    out_index = (mPastLength + i) / hP     // hP 块索引
+    in_index  = (mPastLength + i) % hP     // 块内偏移
+    // 写入 key[out_index, :, :, in_index]
+
+ProcessKey (TQ3):
+  bytesPerSeq = (headDim / blockSize) × bytesPerBlock
+  直接按序写入每行字节 (3.5 bits/value 压缩格式)
+
+ProcessKey (INT8):
+  MNNQuantAttentionKey → 打包为 INT8 GEMM 格式 + scale/bias</pre>
+
+<h2>Prefill 流程 (llm.cpp:930-996)</h2>
+<pre>generate(input_embeds, max_tokens):
+  1. setKVCacheInfo:  mMeta->add = seq_len
+
+  2. forwardVec(input_embeds):            // ★ Prefill
+       gen_attention_mask(seq_len)        // 因果 mask (下三角)
+       gen_position_ids(seq_len)          // 位置 [0, 1, ..., seq-1]
+       forwardRaw(embeds, mask, pos)      // 运行 MNN 图
+       mMeta->synchronize()               // previous += seq_len
+
+  3. updateContext(seq_len, 0):           // all_seq_len += seq_len
+
+  ★ 全 prompt 并行处理, 建立完整 KV Cache</pre>
+
+<h2>分块 Prefill (长 Prompt 优化)</h2>
+<pre>// llm.cpp:624
+如果 prompt 太长, 按 mBlockSize 分块:
+
+mMeta->add = blockSize;
+for i in [0..blockCount]:
+  forwardRaw(embeddings[i], mask, pos)
+  updateContext(blockSize, 0)   // 不增加 gen_seq_len (跳过解码)
+
+★ 每块的 KV 都追加到缓存, 下一块能用到历史的 K/V</pre>
+
+<h2>Decode 流程 (generate.cpp:42-86)</h2>
+<pre>ArGeneration::generate():
+  while (len < max_token):
+    1. sample(logits)                     // 从最后 logit 取 next token
+       → 采样策略: Top-K, Top-P, Temperature
+
+    2. output_tokens.push_back(token)
+
+    3. updateContext(0, 1)                // gen_seq_len += 1
+
+    4. forwardVec({token}):               // ★ Decode
+         mMeta->add = 1                   // 追加 1 个 KV 位置
+         gen_attention_mask(1)            // 单 token, 无 mask
+         gen_position_ids(1)              // 位置 = all_seq_len
+
+    5. updateContext(1, 0)                // all_seq_len += 1</pre>
+
+<h2>Prefill vs Decode 本质区别</h2>
+<table>
+<tr><th></th><th>Prefill</th><th>Decode</th></tr>
+<tr><td>输入</td><td>prompt 全部 token (N 个)</td><td>1 个新 token</td></tr>
+<tr><td>并行性</td><td>N 个 token 并行 (compute-bound)</td><td>串行 (memory-bound)</td></tr>
+<tr><td>KV Cache</td><td>新建, 追加 N 个位置</td><td>追加 1 个位置</td></tr>
+<tr><td>Attention</td><td>Q[N,d] × K[N,d]^T (完整矩阵乘)</td><td>Q[1,d] × K[prev+N,d]^T (向量 × 矩阵)</td></tr>
+<tr><td>瓶颈</td><td>计算密集: GEMM 大矩阵</td><td>内存密集: 逐层加载权重</td></tr>
+<tr><td>MNN 优化</td><td>分块 Prefill, Flash Attention</td><td>TQ3/TQ4 量化 KV Cache, 推测解码</td></tr>
+</table>
+
+<h2>关键文件</h2>
+<ul>
+  <li><code>source/core/KVMeta.hpp</code> — KVMeta 结构 (KVCache 生命周期)</li>
+  <li><code>source/backend/cpu/CPUKVCacheManager.cpp</code> — KV 缓存管理器 (onAlloc/onRealloc/onUpdateKV)</li>
+  <li><code>source/backend/cpu/CPUKVCacheManager.hpp</code> — CPUKVCacheManager 接口</li>
+  <li><code>source/core/KVCacheManager.hpp</code> — 基类 (mPastKey/mPastValue/mPastLength)</li>
+  <li><code>transformers/llm/engine/src/llm.cpp:930</code> — Prefill 主循环</li>
+  <li><code>transformers/llm/engine/src/llm.cpp:624</code> — 分块 Prefill</li>
+  <li><code>transformers/llm/engine/src/generate.cpp:42</code> — Decode 主循环</li>
+  <li><code>transformers/llm/engine/src/sampler.cpp</code> — 采样策略 (TopK/TopP/Temperature)</li>
+  <li><code>source/backend/cpu/compute/TurboQuant.hpp</code> — TQ3/TQ4 KV Cache 压缩</li>
+</ul>
+
+<div class="footer">2026-06-08</div>
+</div>
+</body>
+</html>

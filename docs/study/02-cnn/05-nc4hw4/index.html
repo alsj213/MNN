@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>NC4HW4 数据布局 — MNN 学习</title><link rel="stylesheet" href="../../../mnn.css"></head>
+<body>
+<div class="study-container">
+<div class="nav"><a href="../index.html">← CNN 总览</a><span>05 / NC4HW4 数据布局</span></div>
+<h1>NC4HW4 — MNN 最核心的数据格式</h1>
+<p class="status-tag now">深度完成</p>
+
+<h2>三种格式对比</h2>
+<pre>
+  NCHW:  [N][C][H][W]                      通道平面分离
+  NHWC:  [N][H][W][C]                      像素通道交错
+  NC4HW4: [N][Ceil(C/4)][H][W][4]          4 通道打包, SIMD 对齐
+</pre>
+
+<h2>内存布局详解 (C=10 为例)</h2>
+<pre>
+逻辑形状: [N=1, C=10, H=224, W=224]
+NC4HW4 内存: 1 × 3 groups × 224 × 224 × 4 float = 2,408,448 字节
+
+  Group 0 (ch 0~3):
+    [R₀₀,G₀₀,B₀₀,0] [R₀₁,G₀₁,B₀₁,0] ... [R₀₂₂₃,G₀₂₂₃,B₀₂₂₃,0]
+    ← 每个像素 4 个 float 连续存储, 覆盖通道 0~3
+
+  Group 1 (ch 4~7):
+    同上, 覆盖通道 4~7
+
+  Group 2 (ch 8~9, + padding):
+    [ch8_val, ch9_val, 0, 0] [ch8_val, ch9_val, 0, 0] ...
+    ← 最后 2 通道补零凑够 4
+
+  dim[0] stride = Ceil(C/4) × H × W × 4 = 3 × 50176 × 4 = 602,112
+  dim[1] stride = H × W × 4 = 200,704
+  dim[2] stride = W × 4 = 4 × 224 = 896
+  dim[3] stride = 4</pre>
+
+<h2>为什么选 NC4HW4</h2>
+<pre>ARM NEON 寄存器是 128-bit = 4 × float32
+
+NCHW: 读通道 0 像素 (h,w) → ld1 {v0.s}[0], [addr]      ← 1 个 float, 浪费带宽
+NHWC: 读像素 (h,w) 全通道 → ld1 {v0.4s}, [addr], #16    ← 4 个连续 float, 但通道数可能 ≠ 4 倍数
+
+NC4HW4: 读 Group g 像素 (h,w) → ld1 {v0.4s}, [addr]     ← 精确定 4 float, 天然对齐 SIMD!
+         4 个通道的 SIMD 操作无需 gather/scatter
+
+内存对齐: 4 × 4 bytes = 16 bytes 对齐, 满足 NEON ld1 要求</pre>
+
+<h2>步幅计算 setLinearLayout</h2>
+<pre>// TensorUtils.cpp:140
+void TensorUtils::setLinearLayout(Tensor* tensor) {
+    int size = 1;
+    for (int i = buffer.dimensions - 1; i >= 0; --i) {
+        auto extent = buffer.dim[i].extent;
+        // ★ 关键: dim[1] (通道维) 在 NC4HW4 下按 4 对齐
+        if (1 == i && dimFormat == MNN_DATA_FORMAT_NC4HW4)
+            extent = ROUND_UP(extent, 4);
+        buffer.dim[i].stride = size;
+        size *= extent;
+    }
+}
+
+// 结果 (C=10, H=224, W=224):
+//   dim[3].extent=224, stride=4        ← 最内层 4 个 float
+//   dim[2].extent=224, stride=W*4=896
+//   dim[1].extent=10,  stride=H*W*4    ← extent 还是逻辑 C=10, 但 size 都 × ROUND_UP
+//   dim[0].extent=1,   stride=602112</pre>
+
+<h2>size() 的对齐修正</h2>
+<pre>// Tensor.cpp:409
+size_t Tensor::usize() const {
+    size_t dataSize = mBuffer.type.bytes();
+    for (int i = 0; i < buffer.dimensions; i++) {
+        int currentDimSize = mBuffer.dim[i].extent;
+        if (dimFormat == MNN_DATA_FORMAT_NC4HW4 && 1 == i)
+            currentDimSize = ALIGN_UP4(currentDimSize);  // C=10 → 12
+        dataSize *= currentDimSize;
+    }
+    return dataSize;
+}
+
+// C=10 → 分配 12 组空间, 最后 2 组填零</pre>
+
+<h2>Pack C4: NCHW → NC4HW4</h2>
+<pre>// MNNPackC4.S — NEON 汇编, 核心是 st4 指令
+
+ld1 {v0.4s}, [x1], #16    // 加载通道 0, 4 个像素
+ld1 {v1.4s}, [x5], #16    // 加载通道 1
+ld1 {v2.4s}, [x6], #16    // 加载通道 2
+ld1 {v3.4s}, [x7], #16    // 加载通道 3
+
+st4 {v0.4s, v1.4s, v2.4s, v3.4s}, [x0], #64
+// st4 交错存储: [c0₀,c1₀,c2₀,c3₀, c0₁,c1₁,c2₁,c3₁, ...]
+// 就是 NC4HW4 的 Group 内布局!
+
+// 不足 4 通道时:
+// C=3: ld1 ×3 + movi v3.4s, #0 → st4 同样, 自动补零
+// C=2: ld1 ×2 + movi v2,v3 = #0
+// C=1: ld1 ×1 + movi v1,v2,v3 = #0</pre>
+
+<h2>Unpack C4: NC4HW4 → NCHW</h2>
+<pre>// MNNUnPackC4.S — NEON 汇编, 核心是 ld4 指令
+
+ld4 {v0.4s, v1.4s, v2.4s, v3.4s}, [x0], #64
+// ld4 交错反读: 从 NC4HW4 恢复 4 个通道平面
+
+st1 {v0.4s}, [x1], #16    // 通道 0 → NCHW 平面
+st1 {v1.4s}, [x5], #16    // 通道 1 → NCHW 平面
+st1 {v2.4s}, [x6], #16    // 通道 2
+st1 {v3.4s}, [x7], #16    // 通道 3</pre>
+
+<h2>图像处理中的 C4 概念</h2>
+<pre>// MNNC3ToC4Fast.S: RGB(3ch) → RGBA(4ch) 转换
+ld3 {v0.16b, v1.16b, v2.16b}, [x0], #48   // R, G, B 各 16 pixel
+st4 {v0.16b, v1.16b, v2.16b, v3.16b}, [x1], #64  // + Alpha=255
+
+// MNNBlitC3ToFloatRGBA.S: uint8 RGB → float32 NC4HW4
+ld3 {v0.8b, v1.8b, v2.8b}, [x0], #24          // 8 pixel RGB
+uxtl + ucvtf: uint8 → float32
+fsub + fmul: 减均值 × 归一化
+st4 {v0.4s, v1.4s, v2.4s, v3.4s}, [x1], #64  // 直接输出 NC4HW4 格式!</pre>
+
+<h2>跨后端流转: NC4HW4 全程不变</h2>
+<pre>
+输入 [NCHW]  →  copyFromHostTensor → NC4HW4  (Pack 一次)
+   ↓
+内部全流程  NC4HW4 × NC4HW4 × NC4HW4...
+   ↓  (Convolution → ReLU → Pool → ... 全程不转格式)
+   ↓
+输出 [NC4HW4] → copyToHostTensor → NCHW  (Unpack 一次)
+
+★ 只在边界转换, 内部零开销, 这是 NC4HW4 的核心价值!
+</pre>
+
+<h2>MNNPackC4ForMatMul_A 中的 NC4HW4 解读</h2>
+<pre>// 源数据是 NC4HW4 格式: [Ceil(L/4)][eP][4]
+// 需要转成 MatMul 的 Packed A: [L][eP]
+
+source[xC * eReal * 4 + y * 4 * offset + xR]
+  ↑                       ↑              ↑
+  xC-th 通道组跳转        y 行偏移        组内子通道 (0~3)
+
+// transpose_4x4 把 eP 维和 C4 维互换 → 按通道排列的连续矩阵</pre>
+
+<h2>关键文件</h2>
+<ul>
+  <li><code>include/MNN/Tensor.hpp:30</code> — DimensionType::CAFFE_C4</li>
+  <li><code>source/core/TensorUtils.hpp:42</code> — MNN_DATA_FORMAT_NC4HW4</li>
+  <li><code>source/core/TensorUtils.cpp:140</code> — setLinearLayout (stride 计算)</li>
+  <li><code>source/core/Tensor.cpp:409</code> — usize() (ALIGN_UP4)</li>
+  <li><code>source/backend/cpu/CPUTensorConvert.cpp:53</code> — convert (格式转换调度)</li>
+  <li><code>source/backend/cpu/compute/CommonOptFunction.cpp:990</code> — MNNPackC4Common (C++ 参考)</li>
+  <li><code>source/backend/cpu/arm/arm64/MNNPackC4.S</code> — NEON st4 打包汇编</li>
+  <li><code>source/backend/cpu/arm/arm64/MNNUnPackC4.S</code> — NEON ld4 解包汇编</li>
+  <li><code>source/backend/cpu/arm/arm64/MNNC3ToC4Fast.S</code> — RGB→C4 图像预处理</li>
+</ul>
+
+<h2>面试重点</h2>
+<div class="qa">
+<div class="q">NC4HW4 和 NCHW/NHWC 的核心区别？</div>
+<div class="a">NC4HW4 把通道按 4 分组, 组内 4 通道交错存储。NCHW 按通道分离整个平面, NHWC 按像素交错全部通道。NC4HW4 是 SIMD 最优: 4 个 float 天然对齐 128-bit 寄存器, Pack/Unpack 在边界只做一次。</div>
+</div>
+<div class="qa">
+<div class="q">dim[1].extent 存的是逻辑 C 还是 Ceil(C/4)？</div>
+<div class="a">存的是逻辑 C (如 10)。步幅和 size 计算时自动 ROUND_UP(C,4)，所以实际分配的内存是 Ceil(C/4)×H×W×4。这样向上层代码透明的格式对外呈现为 NCHW 语义。</div>
+</div>
+<div class="qa">
+<div class="q">为什么 MNN 不用 NHWC？</div>
+<div class="a">NHWC 在像素维交错所有通道, 卷积核覆盖多个像素时需要跨 stride 访问, 不利于 Im2Col 的连续地址计算。NC4HW4 的 4 通道组合在空间上是连续的, Im2Col 的 srcPtr 计算可以批量处理 4 通道, 减少一半指针运算。</div>
+</div>
+
+<h2>深度总结</h2>
+<div class="checklist">
+<div class="checklist-item done">✅ NC4HW4 = [N][Ceil(C/4)][H][W][4], 4 通道 SIMD 对齐</div>
+<div class="checklist-item done">✅ stride 计算: dim[1] extent 存逻辑 C, ROUND_UP 只在 size/stride 时生效</div>
+<div class="checklist-item done">✅ Pack: st4 交错 4 通道, 不足补零; Unpack: ld4 反向恢复</div>
+<div class="checklist-item done">✅ 全流程 NC4HW4 不变, 只在输入输出边界各转换一次</div>
+<div class="checklist-item done">✅ 图像预处理直接输出 NC4HW4: MNNC3ToC4Fast + MNNBlitC3ToFloatRGBA</div>
+<div class="checklist-item done">✅ MNNPackC4ForMatMul_A 在 NC4HW4 源上做 transpose → 密集 MatMul 矩阵</div>
+</div>
+
+<div class="footer">2026-06-08</div>
+</div>
+</body>
+</html>

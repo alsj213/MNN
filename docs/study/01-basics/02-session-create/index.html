@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>创建 Session — MNN 学习</title><link rel="stylesheet" href="../../../mnn.css"></head>
+<body>
+<div class="study-container">
+<div class="nav"><a href="../../../mnn.html">← 返回总览</a><span>02 / 创建 Session</span></div>
+<h1>创建 Session — Schedule 调度</h1>
+<p class="status-tag done">深度完成</p>
+
+<h2>完整调用链</h2>
+<pre>Interpreter::createSession(config)
+  └─ createMultiPathSession(configs)
+       │
+       ├─ 1. createRuntime(configs)
+       │       └─ RuntimeFactory::create(Backend::Info)
+       │
+       ├─ 2. Schedule::schedule(info, net, configs, runtime)
+       │       │
+       │       ├─ 2a. initConstTensors(allTensors, ...)
+       │       │       └─ tensors.resize(tensorName->size())
+       │       │       └─ Const Op → 加载权重
+       │       │
+       │       ├─ 2b. initTensors(allTensors, net)
+       │       │       └─ 创建输入/输出 Tensor
+       │       │
+       │       ├─ 2c. for each config:
+       │       │       ├─ getAppropriateType(config) 选后端
+       │       │       ├─ _scheduleUnit()
+       │       │       │    ├─ generateScheduleGraph() 拓扑排序
+       │       │       │    └─ initPipelineInfosFromOps() 连线
+       │       │       └─ BackendCache
+       │       │
+       │       ├─ 2d. 标记输入/输出 Tensor
+       │       └─ 2e. buildConstantTensors() 常量折叠
+       │
+       ├─ 3. new Session(info, modes, runtime)
+       │       └─ createPipelineBackend()
+       │            ├─ primary Backend (GPU/CUDA/...)
+       │            └─ backup Backend (CPU fallback)
+       │
+       └─ return Session*</pre>
+
+<h2>Step 1: 后端选择</h2>
+<pre>getAppropriateType(config)
+  if config.type != AUTO → 返回用户指定的后端
+  if config.type == AUTO → 按优先级检测可用后端
+    [HIAI, CoreML, TensorRT, CUDA, OpenCL, Metal, Vulkan, CPU]
+    返回第一个可用的
+  都不行 → CPU 兜底</pre>
+
+<h2>Step 2: 图调度</h2>
+<p>默认直接按 oplists 原序取所有 Op。指定 path 时做子图裁剪：</p>
+<pre>1. output tensor 标记 mask=1, input tensor 标记 mask=2
+2. 遍历 Op，如果其 outputIndexes 指向 mask=1 的 tensor：
+   → Op 保留，其 inputIndexes 的 tensor 也标记为 mask=1
+3. 重复到无变化 → 只保留 input→output 路径上的 Op</pre>
+
+<h2>Step 3: Op-Tensor 连线</h2>
+<pre>for each op:
+  for idx in op->outputIndexes():
+    info.outputs.push_back(allTensors[idx])
+  for idx in op->inputIndexes():
+    info.inputs.push_back(allTensors[idx])</pre>
+<p>把 int 索引转成 Tensor* 指针。</p>
+
+<h2>Step 4: Pipeline 分组</h2>
+<pre>scheduleInfo.pipelineInfo = [
+  {BackendCache{type=OPENCL}, [Op...]},
+  {BackendCache{type=CPU},    [Op...]},
+]</pre>
+
+<h2>Step 5: 创建 Backend</h2>
+<pre>createPipelineBackend():
+  primary = rt->onCreate(config)     // 目标后端
+  if primary != CPU:
+    backup = cpu->onCreate(...)      // CPU fallback
+  else:
+    backup = primary</pre>
+
+<h2>调度层核心数据结构</h2>
+<p>调度层的难点在于多层嵌套的"信息传递"：Schedule 只有"信息"没有"对象"，它写配置；Session 拿到配置后才创建真正的执行对象。</p>
+
+<h3>三层嵌套结构</h3>
+<pre>ScheduleInfo  (整个 Session 的执行计划)
+│
+├── allTensors              ← 所有 Tensor 的全局数组
+├── inputTensors            ← 用户输入映射
+├── outputTensor            ← 用户输出映射
+├── defaultBackend          ← 常量权重后端 (shared_ptr)
+└── pipelineInfo[]          ← N 个硬件子图 (N = config 个数)
+     │
+     ├── BackendCache       ← 这个子图用哪个硬件
+     │    ├── info               ← Backend::Info (type, numThread, config)
+     │    ├── cache.first        ← primary Backend (GPU/CPU/...)
+     │    └── cache.second       ← backup Backend (CPU fallback)
+     │
+     └── OpCacheInfo[]      ← 这个子图包含哪些 Op
+          ├── op                 ← Op* (指向模型中的算子)
+          ├── inputs             ← 输入 Tensor 列表
+          ├── outputs            ← 输出 Tensor 列表
+          └── executeBuffer      ← CommandBuffer (运行时命令)
+               └── command[]     ← 每个 Command 包含 Execution</pre>
+
+<h3>三层转换流程</h3>
+<pre>ScheduleConfig                createPipelineBackend()            Pipeline::encode()
+  │                              │                                 │
+  ▼                              ▼                                 ▼
+BackendCache.info  ──────►  BackendCache.cache      ──────►   Command.execution
+(配置描述)                    (Backend 实例)                     (Execution 实例)
+
+
+PipelineInfo(Schedule产出)    Session构造函数                  Session::run()
+  │                              │                                 │
+  ▼                              ▼                                 ▼
+vector&lt;OpCacheInfo&gt;     ──►  Pipeline 对象               Pipeline::execute()
+(Op 列表)                      (可执行对象)                      (逐条执行 Command)</pre>
+
+<h3>三个原则</h3>
+<ul>
+  <li><b>Schedule 不执行，只做计划</b> — 生成 ScheduleInfo（含 pipelineInfo）</li>
+  <li><b>Pipeline 不计划，只执行</b> — 持有 Backend（primary + backup）+ CommandBuffer</li>
+  <li><b>PipelineInfo 是计划和执行之间的"信使"</b> — 把"配置"变成"对象"</li>
+</ul>
+
+<h2>createMultiPathSession 全流程</h2>
+<pre>Session* Interpreter::createMultiPathSession(configs, runtime)
+
+① 同步 RuntimeHint 到每个 Runtime
+   for each runtime → setRuntimeHint(mNet->modes.runtimeHint)
+
+② 加锁 + Schedule 编排
+   Schedule::schedule(info, mNet->net, configs, runtime)
+   → 生成 ScheduleInfo（含 pipelineInfo）
+
+③ 加载 GPU tuning 缓存
+   runtime->onSetCache(cacheBuffer)   // 省去重新 tuning
+
+④ new Session (核心转换)
+   Session(info, modes, runtime)
+   → for each pipelineInfo:
+        createPipelineBackend()  // BackendCache → Backend 实例
+        new Pipeline()           // OpCacheInfo → Pipeline 对象
+
+⑤ 自动 resize（默认 Direct 模式）
+   result->resize() → Pipeline::encode() → 形状推导 + 内存分配
+
+⑥ 写回 tuning 缓存文件
+   if 首次 → result->getCache() → writeCacheFile()
+
+⑦ Session 存入 Interpreter
+   mNet->sessions.emplace_back(unique_ptr&lt;Session&gt;)</pre>
+
+<h2>Pipeline 执行顺序</h2>
+<pre>Session::run()
+  └─ for each Pipeline (按 config 顺序)
+       └─ Pipeline::execute()
+            ├─ _copyInputs()           ← 拷贝用户输入
+            ├─ _enterExecute()         ← Backend::onExecuteBegin()
+            └─ for each OpCacheInfo (按模型 oplists 拓扑序)
+                 └─ for each Command
+                      └─ Execution::onExecute(inputs, outputs)
+            └─ _exitExecute()          ← Backend::onExecuteEnd()</pre>
+
+<table>
+  <tr><th>场景</th><th>几个 Pipeline</th><th>执行顺序</th></tr>
+  <tr><td>单 config（最常见）</td><td><b>1 个</b></td><td>按模型 oplists 原序（拓扑序）</td></tr>
+  <tr><td>多 config（异构路径）</td><td><b>N 个</b></td><td>config[0] Pipeline → config[1] Pipeline → ...</td></tr>
+  <tr><td>Pipeline 内 Op</td><td>同一后端</td><td>拓扑序，CONSTANT 跳过，不支持的 Op 走 backup CPU</td></tr>
+</table>
+
+<h2>核心概念总结</h2>
+
+<div class="qa">
+<div class="q">Interpreter 怎么持有 Session？</div>
+<div class="a">Content 用 <code>vector&lt;unique_ptr&lt;Session&gt;&gt;</code> 持有唯一所有权。createSession 返回裸指针，Interpreter 析构时自动销毁所有 Session。</div>
+</div>
+
+<div class="qa">
+<div class="q">RuntimeInfo 是什么？</div>
+<div class="a"><code>pair&lt;map&lt;MNNForwardType, shared_ptr&lt;Runtime&gt;&gt;, shared_ptr&lt;Runtime&gt;&gt;</code><br>
+第一项各硬件 Runtime 映射表，第二项 CPU Runtime 兜底。</div>
+</div>
+
+<div class="qa">
+<div class="q">Runtime 的功能？</div>
+<div class="a">硬件抽象工厂 + 资源管理器：onCreate() 创建 Backend、onGabageCollect() 回收、onSetCache() GPU 缓存、onGetCompilerType() 编译策略。</div>
+</div>
+
+<div class="qa">
+<div class="q">多 Session 共享 Runtime？</div>
+<div class="a">shared_ptr&lt;Runtime&gt; 实现引用计数共享，多个 Session 指向同一个 Runtime，共享内存池和 tuning 缓存。</div>
+</div>
+
+<div class="qa">
+<div class="q">setRuntimeHint？</div>
+<div class="a">用户 setSessionHint 设置选项存入 RuntimeHint，createSession 时同步到每个 Runtime。控制 tuning 次数、KV Cache 限制、Attention 量化等。</div>
+</div>
+
+<div class="qa">
+<div class="q">Schedule::schedule()？</div>
+<div class="a">Op 列表 → 按后端分组的执行计划：加载权重、创建 Tensor、选后端+拓扑排序、常量折叠。</div>
+</div>
+
+<div class="qa">
+<div class="q">configs 何时多个？</div>
+<div class="a">createMultiPathSession 传入 vector 时。每个 config 指定不同后端/路径，实现异构推理。大多场景只用单个 config。</div>
+</div>
+
+<div class="qa">
+<div class="q">buildConstantTensors？</div>
+<div class="a">常量折叠：Op 所有输入为常量则输出也是常量，编译期算好推理时跳过。发生在 Schedule 阶段，此时 shape 已确定。</div>
+</div>
+
+<div class="qa">
+<div class="q">GPU 不支持某 Op？</div>
+<div class="a">backup Backend（CPU fallback）。primary 跑 GPU，不支持的 Op 自动 fallback 到 CPU。</div>
+</div>
+
+<div class="qa">
+<div class="q">AUTO 后端优先级？</div>
+<div class="a">HIAI > CoreML > TensorRT > CUDA > OpenCL > Metal > Vulkan > CPU。</div>
+</div>
+
+<h2>进阶面试题</h2>
+
+<div class="qa">
+<div class="q">Session 和 Module API 有什么区别？</div>
+<div class="a"><b>Session API（底层）</b>：Interpreter → createSession → runSession，直接操作 Tensor。适合需要精细控制输入输出、多 batch 推理的场景。<br>
+<b>Module API（高层）</b>：Module::load → onForward(VARP)，基于 Express 动态图，内部封装了 Session 创建。适合 LLM/Diffusion 等现代模型，使用更简洁。<br>
+核心差异：Module API 自动管理内存和 shape，Session API 需要手动 resize。</div>
+</div>
+
+<div class="qa">
+<div class="q">createRuntime 怎么找到对应的后端？</div>
+<div class="a">通过全局注册表 <code>RuntimeFactory::create(Backend::Info)</code>。每个后端在初始化时调用 <code>MNNInsertExtraRuntimeCreator(type, creator)</code> 注册自己的 RuntimeCreator。createRuntime 遍历 config 中的 type，从注册表查找对应的 Creator 来创建 Runtime。<br>
+这种插件式设计让新增后端不需要修改核心代码。</div>
+</div>
+
+<div class="qa">
+<div class="q">BackendConfig 有哪些配置项？</div>
+<div class="a"><pre>struct BackendConfig {
+    enum Precision { Precision_Normal, Precision_High, Precision_Low, Precision_Low_BF16 };
+    enum Memory    { Memory_Normal, Memory_High, Memory_Low };
+    enum Power     { Power_Normal, Power_High, Power_Low };
+
+    Precision precision = Precision_Normal;  // 精度偏好
+    Memory    memory    = Memory_Normal;     // 内存偏好
+    Power     power     = Power_Normal;      // 功耗偏好
+    int flags = 0;                           // 特殊标志
+};
+// Low Precision → FP16 推理
+// Low Memory → 更激进的内存复用
+// 这些影响 Backend 的行为但不影响 Schedule</pre></div>
+</div>
+
+<div class="qa">
+<div class="q">Session::ModeGroup 有哪些模式？</div>
+<div class="a"><pre>struct ModeGroup {
+    SessionMode callBackMode;    // Debug / Release
+    SessionMode inputMode;       // Inside(自动管理) / User(用户管理)
+    SessionMode outputMode;      // Inside / User
+    SessionMode backendMode;     // Fix(固定) / Auto(自动切换)
+    SessionMode resizeMode;      // Direct(立即) / Defer(延迟)
+    SessionMode memoryUsageMode; // Collect / Cache
+    SessionMode codegenMode;     // 代码生成开关
+};
+// 通过 setSessionMode() 设置，影响 Session 的整个生命周期行为</pre></div>
+</div>
+
+<div class="qa">
+<div class="q">Pipeline::encode() 和 execute() 什么区别？</div>
+<div class="a"><b>encode()</b>：编译期。形状推导、Geometry 分解 Op、分配内存。只在 resize 时调用一次。<br>
+<b>execute()</b>：运行期。逐条执行 Command。每次 runSession 都调用。<br>
+类比：encode 是写剧本，execute 是演戏。剧本写好（分配好内存、确定好执行计划）后，可以反复演（多次 execute）。</div>
+</div>
+
+<div class="qa">
+<div class="q">runSession 的线程安全怎么保证？</div>
+<div class="a">Interpreter 内部用 <code>mutex lock</code> 保护。同一个 Interpreter 的多个 Session 可以并发 run（每个 Session 有自己的 Pipeline 和 Tensor），但 createSession 和 updateCacheFile 等操作会互斥。多个 Interpreter 实例之间完全独立。</div>
+</div>
+
+<div class="qa">
+<div class="q">Session::clone() 有什么用？</div>
+<div class="a">克隆一个 Session，共享同一个模型的权重（Const Tensor），但激活 Tensor 独立。用于多路并行推理场景：服务器同时处理多个请求，每个请求 clone 一个 Session 单独跑，权重只有一份，节省内存。<br>
+注：clone 的功能在后来的 Module API 中有更好的实现。</div>
+</div>
+
+<div class="qa">
+<div class="q">GPU 不支持某 Op 时 Pipeline 内如何处理？</div>
+<div class="a">Pipeline 内部每个 Command 创建 Execution 时，先尝试 primary Backend（如 GPU），如果返回 nullptr（不支持），就 fallback 到 backup CPU Backend。然后 <code>_SetTensorBackend</code> 标记每个 Tensor 所在后端，<code>_InsertCopy</code> 自动在跨后端的 Command 之间插入 <b>WrapExecution（Copy 命令）</b>做设备间数据拷贝。
+<br>最终执行序列从 <code>GPU → CPU → GPU</code> 变成 <code>GPU → Copy(GPU→CPU) → CPU → Copy(CPU→GPU) → GPU</code>。代价是跨设备拷贝的开销。</div>
+</div>
+
+<div class="qa">
+<div class="q">和 NCNN/TNN/TensorRT 的调度有什么不同？</div>
+<div class="a"><b>MNN</b>：每个 Op 做一次后端检查 → 分配到后端 + 加一个 Pipeline。相同后端的连续 Op 合并为一个 Pipeline。<br>
+<b>NCNN</b>：单一 Vulkan 后端，所有 Op 尽量跑 GPU，不行就 CPU 内 fallback。<br>
+<b>TensorRT</b>：整个图优化为 engine，做层融合 + 内核自动调优，调度完全由 engine 内部管理。<br>
+MNN 的优势是轻量 + 后端灵活切换；劣势是 Pipeline 间有同步开销。</div>
+</div>
+
+<div class="qa">
+<div class="q">MNN 有自动异构策略吗？</div>
+<div class="a"><b>没有</b>。MNN_FORWARD_AUTO 只是帮用户选一个最快的后端跑<b>整个模型</b>，不会智能拆分 Op 到不同硬件。<br>
+MNN 提供的三种"异构"机制：<br>
+1. <b>AUTO 模式</b>：检测到哪个后端可用就用哪个，整个模型跑在一个后端上。<br>
+2. <b>CPU fallback</b>：被动的 Op 级别兜底——primary 不支持才切 CPU，不是主动调度。<br>
+3. <b>多 config 手动拆分</b>：用户自己分析模型，通过 path 指定子图边界，每个 config 对应一个 Pipeline。<br>
+设计取舍：MNN 定位轻量推理引擎，自动异构需要 profiling + 跨硬件管理，复杂度大增且启动慢。</div>
+</div>
+
+<div class="qa">
+<div class="q">多 config 手动拆分需要加载多个模型文件吗？</div>
+<div class="a"><b>不需要</b>。加载<b>一次</b>模型文件（Net），多个 config 对同一个 Net 做不同的子图裁剪。每个 config 调用 <code>generateScheduleGraph()</code>，通过 path.inputs/path.outputs 只提取路径上的 Op，然后各跑各的后端。</div>
+</div>
+
+<div class="qa">
+<div class="q">RuntimeInfo 的 first 和 second 分别是什么？</div>
+<div class="a"><b>first</b>：<code>map&lt;MNNForwardType, shared_ptr&lt;Runtime&gt;&gt;</code>，各硬件 Runtime 映射表（如 OPENCL→OpenCLRuntime、CPU→CPURuntime）。<br>
+<b>second</b>：<code>shared_ptr&lt;Runtime&gt;</code>，CPU Runtime 始终可用，保证 fallback 能跑。<br>
+多 Session 通过 shared_ptr 共享同一个 RuntimeInfo，从而共享 GPU 缓存、tuning 结果、内存池。</div>
+</div>
+
+<div class="qa">
+<div class="q">createMultiPathSession 有哪些关键步骤？</div>
+<div class="a">七步：① 同步 RuntimeHint → ② 加锁 + Schedule::schedule 生成计划 → ③ 加载 GPU tuning 缓存 → ④ new Session（pipelineInfo→Pipeline+Backend）→ ⑤ 自动 resize（形状推导+内存分配）→ ⑥ 写回 tuning 缓存 → ⑦ Session 存入 Interpreter。</div>
+</div>
+
+<div class="qa">
+<div class="q">PipelineInfo 为什么设计成 pair 别名？</div>
+<div class="a"><code>pair&lt;BackendCache, vector&lt;OpCacheInfo&gt;&gt;</code> 把<b>"用什么硬件"</b>和<b>"算什么东西"</b>绑在一起。BackendCache 描述后端配置（类型/线程/精度），OpCacheInfo 描述 Op 列表（Op*/Tensor/Command）。Pipeline 构造函数同时拿到这两者，才能创建 Backend 实例并为每个 Op 创建 Execution。</div>
+</div>
+
+<h2>关键文件</h2>
+<ul>
+  <li><code>source/core/Interpreter.cpp:255</code> — createMultiPathSession</li>
+  <li><code>source/core/Interpreter.cpp:639</code> — createRuntime</li>
+  <li><code>source/core/Schedule.cpp:291</code> — Schedule::schedule 主流程</li>
+  <li><code>source/core/Schedule.cpp:282</code> — _scheduleUnit</li>
+  <li><code>source/core/Schedule.cpp:162</code> — generateScheduleGraph</li>
+  <li><code>source/utils/InitNet.cpp:44</code> — initConstTensors</li>
+  <li><code>source/utils/InitNet.cpp:120</code> — initTensors</li>
+  <li><code>source/geometry/GeometryComputerUtils.cpp:52</code> — buildConstantTensors</li>
+  <li><code>source/core/Session.cpp:157</code> — Session 构造函数</li>
+  <li><code>source/core/Session.cpp:22</code> — createPipelineBackend</li>
+  <li><code>source/core/Backend.cpp:132</code> — onAcquireBuffer</li>
+  <li><code>source/core/Command.hpp:19</code> — Command / CommandBuffer</li>
+  <li><code>source/core/Schedule.hpp:88</code> — BackendCache</li>
+  <li><code>source/core/Schedule.hpp:63</code> — OpCacheInfo</li>
+</ul>
+
+
+<h2>深度总结</h2>
+<div style="font-size:13px; display:grid; grid-template-columns:1fr 1fr; gap:6px 24px; margin:8px 0 20px 0;">
+  <div>createRuntime → RuntimeFactory::create()</div>
+  <div>ScheduleConfig / Path 模型切分</div>
+  <div>initConstTensors（遍历 CONST Op，创建 + 填充权重 + 分配内存）</div>
+  <div>initTensors（补齐壳子、输入形状、量化参数、静态模型全部形状）</div>
+  <div>allTensors 索引映射（FlatBuffers index → Tensor*）</div>
+  <div>_scheduleUnit → Pipeline 算子列表</div>
+  <div>setInputOutputForOps（标记 INPUT/OUTPUT/NORMAL）</div>
+  <div>buildConstantTensors（常量折叠 + breakIndex 切割）</div>
+  <div>Session 构造函数（createPipelineBackend + new Pipeline）</div>
+  <div>RuntimeInfo 结构（map&lt;Type,Runtime&gt; + 默认 Runtime）</div>
+  <div>调优缓存（读缓存 → 首次 tuning → 写缓存）</div>
+  <div>auto resize（条件判断 + resizeMode/inputMode）</div>
+</div>
+
+<div class="footer">2026-05-18 · 深度更新 2026-05-26</div>
+</div>
+</body>
+</html>

@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>后端与异构 — MNN 学习</title><link rel="stylesheet" href="../../mnn.css"></head>
+<body>
+<div class="study-container">
+<div class="nav"><a href="../../mnn.html">← 返回总览</a><span>第六阶段 / 后端与异构计算</span></div>
+<h1>后端与异构计算 — 多硬件抽象层</h1>
+<p class="status-tag">待学习</p>
+
+<h2>概览</h2>
+<p>MNN 通过 Backend 抽象层支持 CPU (ARM NEON/RISC-V/x86)、GPU (OpenCL/Vulkan/Metal)、NPU (CoreML/NNAPI/QNN) 多种硬件后端。同一模型在不同后端执行，通过 Backend::onCreate 工厂实现多态。</p>
+
+<h2>后端总览</h2>
+<table>
+<tr><th>后端</th><th>目录</th><th>特点</th></tr>
+<tr><td>CPU</td><td><code>source/backend/cpu/</code></td><td>ARM NEON / RISC-V RVV / x86 SSE/AVX / Intel OneDNN / Arm KleidiAI</td></tr>
+<tr><td>OpenCL</td><td><code>source/backend/opencl/</code></td><td>通用 GPU (Adreno / Mali / desktop GPU)</td></tr>
+<tr><td>Vulkan</td><td><code>source/backend/vulkan/</code></td><td>跨平台 GPU API (Android / Linux / Windows)</td></tr>
+<tr><td>Metal</td><td><code>source/backend/metal/</code></td><td>Apple GPU (iOS / macOS，高性能着色器)</td></tr>
+<tr><td>CUDA</td><td><code>source/backend/cuda/</code></td><td>NVIDIA GPU (TensorRT / cuBLAS)</td></tr>
+<tr><td>ARM82</td><td><code>source/backend/arm82/</code></td><td>ARM v8.2+ (fp16/fp16 winograd/dot product)</td></tr>
+<tr><td>CoreML</td><td><code>source/backend/coreml/</code></td><td>Apple NPU (ANE 加速)</td></tr>
+<tr><td>NN API</td><td><code>source/backend/nnapi/</code></td><td>Android Neural Networks API</td></tr>
+<tr><td>QNN</td><td><code>source/backend/hpp/</code></td><td>Qualcomm NPU</td></tr>
+</table>
+
+<h2>核心主题</h2>
+
+<h3>1. Backend 基类架构</h3>
+<table>
+<tr><th>文件</th><th>说明</th></tr>
+<tr><td><code>source/core/Backend.hpp</code></td><td>Backend 抽象基类：onCreate (Op 工厂) / onAcquireBuffer / onCopyBuffer / onSync 等纯虚函数</td></tr>
+<tr><td><code>source/core/Execution.hpp</code></td><td>Execution 基类：virtual onResize() + onExecute() = 0</td></tr>
+<tr><td><code>source/core/RuntimeFactory.hpp</code></td><td>Runtime 工厂注册（REGISTER_RUNTIME 宏）</td></tr>
+</table>
+
+<pre>// Backend 注册模式:
+// 1. Runtime 注册 → MNN_FORWARD_OPENCL 映射到 OpenCLRuntime
+// 2. Backend 创建 → Runtime::onCreate(BackendConfig) → Backend*
+// 3. Op 创建 → Backend::onCreate(inputs, outputs, op) → Execution*
+// 4. 执行 → Execution::onExecute(workInputs, workOutputs)</pre>
+
+<h3>2. CPU 后端（ARM NEON 深度优化）</h3>
+<table>
+<tr><th>文件</th><th>说明</th></tr>
+<tr><td><code>source/backend/cpu/CPUBackend.cpp</code></td><td>CPU Backend 实现 + ThreadPool</td></tr>
+<tr><td><code>source/backend/cpu/CPUBackend.hpp</code></td><td>CPUBackend 类 + enqueue 桥接</td></tr>
+<tr><td><code>source/backend/cpu/arm/CommonOptFunctionNeon.cpp</code></td><td>NEON 核心函数：MatMul / Pack / Winograd / RoPE</td></tr>
+<tr><td><code>source/backend/cpu/arm/FunctionSummary.hpp</code></td><td>ARM 函数指针声明（统一接口）</td></tr>
+<tr><td><code>source/backend/cpu/arm/arm64/</code></td><td>ARM64 NEON 汇编优化（Pack / MatMul / Convolution 等）</td></tr>
+<tr><td><code>source/backend/cpu/riscv/rvv/</code></td><td>RISC-V Vector 扩展优化</td></tr>
+<tr><td><code>source/backend/cpu/bf16/</code></td><td>BF16 支持</td></tr>
+</table>
+
+<h3>3. OpenCL 后端（GPU Compute）</h3>
+<table>
+<tr><th>文件</th><th>说明</th></tr>
+<tr><td><code>source/backend/opencl/core/OpenCLBackend.hpp</code></td><td>OpenCL Backend + INDIRECT 模式 (onExecuteBegin/End)</td></tr>
+<tr><td><code>source/backend/opencl/core/OpenCLRuntime.hpp</code></td><td>OpenCL Runtime：Context / Queue / Program 管理</td></tr>
+<tr><td><code>source/backend/opencl/execution/</code></td><td>各 Op 的 OpenCL Kernel 实现</td></tr>
+<tr><td><code>source/backend/opencl/cl/</code></td><td>OpenCL Kernel 源码（.cl 文件）</td></tr>
+</table>
+
+<h4>INDIRECT 模式 (GPU 录制-提交)</h4>
+<pre>CPU (DIRECT):                         GPU (INDIRECT):
+onExecute → 即时计算                   onExecute → 录制 cmd buffer
+onExecuteBegin → 空                    onExecuteBegin → 开始录制
+onExecuteEnd → 空                      onExecuteEnd → 提交 + 等待</pre>
+
+<h3>4. 其他 GPU 后端</h3>
+<table>
+<tr><th>后端</th><th>关键文件</th><th>特点</th></tr>
+<tr><td>Vulkan</td><td><code>source/backend/vulkan/</code></td><td>SPIR-V shader，跨平台性能最好</td></tr>
+<tr><td>Metal</td><td><code>source/backend/metal/</code></td><td>MSL shader，Apple 平台首选</td></tr>
+<tr><td>CUDA</td><td><code>source/backend/cuda/</code></td><td>cuBLAS / cuDNN 集成</td></tr>
+</table>
+
+<h3>5. NPU / DSP 后端</h3>
+<table>
+<tr><th>后端</th><th>关键文件</th></tr>
+<tr><td>CoreML (Apple)</td><td><code>source/backend/coreml/backend/CoreMLBackend.cpp</code></td></tr>
+<tr><td>NNAPI (Android)</td><td><code>source/backend/nnapi/backend/NNAPI*.cpp</code></td></tr>
+<tr><td>QNN (Qualcomm)</td><td><code>source/backend/hpp/</code></td></tr>
+</table>
+
+<h3>6. Runtime 注册与调度</h3>
+<table>
+<tr><th>文件</th><th>说明</th></tr>
+<tr><td><code>source/core/RuntimeFactory.hpp</code></td><td>REGISTER_RUNTIME 宏 + RuntimeCreator 注册表</td></tr>
+<tr><td><code>source/core/Schedule.cpp</code></td><td><code>getAppropriateType()</code> 根据 config + 可用后端选择最优</td></tr>
+<tr><td><code>source/core/AutoTime.cpp</code></td><td>自动调优（op time 统计 + 后端选择）</td></tr>
+</table>
+
+<h2>面试重点</h2>
+<div class="qa">
+<div class="q">MNN 如何支持多后端？</div>
+<div class="a">通过 Backend 抽象层。每个后端实现 Backend 的子类（CPUBackend / OpenCLBackend / MetalBackend），重写 onCreate (Op 工厂) / onAcquireBuffer (内存) / onCopyBuffer (拷贝) / onSync (同步)。上层 Pipeline 不关心具体后端。</div>
+</div>
+<div class="qa">
+<div class="q">DIRECT vs INDIRECT 执行模式？</div>
+<div class="a">DIRECT（CPU）：onExecute 直接算完返回。INDIRECT（GPU）：onExecute 只录制 kernel launch，onExecuteEnd 批量提交+等待。INDIRECT 减少 CPU-GPU 同步开销，多个 kernel 可批量提交。</div>
+</div>
+<div class="qa">
+<div class="q">跨后端数据传输怎么处理？</div>
+<div class="a">Pipeline::allocMemory._InsertCopy 检测 Tensor 生产者和消费者的 Backend 是否相同。不同则插入 Copy Command，通过 onCopyBuffer(Backend::onCopyBuffer) 做中转（通常经过 CPU host memory）。</div>
+</div>
+<div class="qa">
+<div class="q">INDIRECT 模式为什么只在 GPU 用？</div>
+<div class="a">GPU kernel launch 有延迟，批量提交（batching）可分摊开销。CPU 计算即算即得，无 command buffer 概念。Metal / OpenCL / Vulkan 都支持 command buffer / command queue 模型。</div>
+</div>
+
+<h2>学习路径建议</h2>
+<ol>
+  <li>Backend 基类架构 + Execution 虚函数机制</li>
+  <li>CPUBackend + ThreadPool + NEON 优化函数指针</li>
+  <li>OpenCL Backend：Runtime (Context/Queue) + Kernel 编译 + INDIRECT 录制-提交</li>
+  <li>Metal Backend：MSL shader + MTLCommandQueue</li>
+  <li>Vulkan Backend：SPIR-V + VkCommandBuffer</li>
+  <li>CUDA Backend：cuBLAS / TensorRT 集成</li>
+  <li>Runtime 注册机制 + AutoTime 自动调优</li>
+  <li>跨后端内存管理 + Copy 中转 + 异构调度策略</li>
+</ol>
+
+<div class="footer">2026-06-05</div>
+</div>
+</body>
+</html>

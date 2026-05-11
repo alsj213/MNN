@@ -1,0 +1,107 @@
+classDiagram
+    direction LR
+
+    class Interpreter {
+        +createSession()
+        +resizeSession()
+    }
+
+    class Session {
+        -mPipelines
+        -mNeedResize
+        -mNeedMalloc
+        +resize()
+    }
+
+    class Pipeline {
+        -mInfo
+        +encode()
+        +allocMemory()
+    }
+
+    class SizeComputer {
+        <<abstract>>
+        +onComputeSize(op, inputs, outputs)*
+    }
+
+    class SizeComputerSuite {
+        -mRegistry
+        +search(OpType) SizeComputer*
+        +insert(SizeComputer*, OpType)
+    }
+
+    class ConvolutionSizeComputer {
+        +onComputeSize()
+    }
+
+    class PoolSizeComputer {
+        +onComputeSize()
+    }
+
+    class BinaryOpComputer {
+        +onComputeSize()
+    }
+
+    class MatMulSizeComputer {
+        +onComputeSize()
+    }
+
+    class OpResizeCache {
+        -mInputInfos
+        +match(inputs, compared) bool
+        +insert(inputs)
+        +close(pass)
+        +open()
+    }
+
+    class OpCacheInfo {
+        +op
+        +inputs
+        +outputs
+        +computeCache
+        +executeBuffer
+    }
+
+    class GeometryComputer {
+        <<abstract>>
+        +onCompute(op, inputs, outputs, ctx, buffer)*
+    }
+
+    class GeometryComputerUtils {
+        +shapeComputeAndGeometryTransform()$
+        +buildConstantTensors()$
+        +makeRaster()$
+    }
+
+    class Command {
+        +op
+        +inputs
+        +outputs
+        +workInputs
+        +workOutputs
+        +execution
+    }
+
+    class Backend {
+        +onAcquireBuffer()
+        +onCreate()
+    }
+
+    class Execution {
+        +onResize()
+        +onExecute()
+    }
+
+    Session --> Pipeline : contains
+    Pipeline --> SizeComputerSuite : uses
+    Pipeline --> GeometryComputerUtils : calls
+    SizeComputerSuite --> SizeComputer : registry
+    SizeComputer <|-- ConvolutionSizeComputer
+    SizeComputer <|-- PoolSizeComputer
+    SizeComputer <|-- BinaryOpComputer
+    SizeComputer <|-- MatMulSizeComputer
+    OpCacheInfo --> OpResizeCache : has
+    OpCacheInfo --> Command : produces
+    GeometryComputerUtils --> OpCacheInfo : processes
+    Command --> Execution : has
+    Backend --> Execution : creates

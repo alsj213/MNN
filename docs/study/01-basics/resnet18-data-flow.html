@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>ResNet18 在 MNN 中的推理数据流转</title>
+<style>
+:root{--bg:#1e1e2e;--card:#2d2d3d;--text:#cdd6f4;--blue:#4361ee;--purple:#7c3aed;--green:#2d6a4f;--orange:#e07a00;--teal:#089aa0;--muted:#6c757d}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI','Noto Sans SC',sans-serif;background:var(--bg);color:var(--text);padding:30px;line-height:1.8}
+.container{max-width:1200px;margin:0 auto}
+h1{font-size:28px;margin-bottom:6px;color:#fff}
+h1 span{font-size:14px;color:var(--muted);display:block;margin-top:4px}
+h2{font-size:22px;margin:40px 0 16px;color:var(--blue);border-left:4px solid var(--blue);padding-left:14px}
+h3{font-size:17px;margin:30px 0 12px;color:var(--teal)}
+h4{font-size:15px;margin:20px 0 8px;color:var(--orange)}
+.card{background:var(--card);border-radius:12px;padding:20px 24px;margin:16px 0;border:1px solid #3a3a4a}
+.card.green{border-left:4px solid var(--green)}
+.card.blue{border-left:4px solid var(--blue)}
+.card.orange{border-left:4px solid var(--orange)}
+.card.purple{border-left:4px solid var(--purple)}
+pre{background:#1a1a2e;border-radius:8px;padding:14px 18px;overflow-x:auto;font-size:13px;line-height:1.6;color:#cdd6f4}
+code{background:#1a1a2e;padding:2px 6px;border-radius:4px;font-size:13px;color:var(--teal)}
+.diagram{background:#fff;border-radius:12px;padding:16px;margin:20px 0;text-align:center}
+.diagram img{max-width:100%;height:auto}
+table{width:100%;border-collapse:collapse;margin:12px 0}
+th,td{text-align:left;padding:8px 12px;border:1px solid #3a3a4a;font-size:13px}
+th{background:var(--blue);color:#fff}
+tr:nth-child(even){background:#252535}
+.footer{text-align:center;color:var(--muted);font-size:13px;padding:40px 0;margin-top:40px;border-top:1px solid #3a3a4a}
+.box{display:inline-block;padding:2px 8px;border-radius:4px;font-size:12px;font-weight:600}
+.box.blue{background:var(--blue);color:#fff}
+.box.green{background:var(--green);color:#fff}
+.box.orange{background:var(--orange);color:#fff}
+.box.purple{background:var(--purple);color:#fff}
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>ResNet18 在 MNN 中的推理数据流转<span>以 ResNet18 为例，完整追踪一张图片从加载到分类的数据变换过程</span></h1>
+
+<!-- ═══ 总览 ═══ -->
+<h2>ResNet18 模型结构速览</h2>
+<div class="card blue">
+<pre>输入: 224 x 224 x 3 RGB 图片
+│
+├─ Conv1:   7x7, S=2, P=3, 3->64           -> 输出: 56x56x64
+├─ BN + ReLU + MaxPool 3x3 S=2            -> 输出: 28x28x64
+│
+├─ Layer1: [Conv3x3 -> BN -> ReLU] x 2     -> 输出: 28x28x64  (64ch)
+├─ Layer2: [Conv3x3 -> BN -> ReLU] x 2     -> 输出: 14x14x128 (128ch)
+├─ Layer3: [Conv3x3 -> BN -> ReLU] x 2     -> 输出: 7x7x256   (256ch)
+├─ Layer4: [Conv3x3 -> BN -> ReLU] x 2     -> 输出: 7x7x512   (512ch)
+│
+├─ Average Pool 7x7                       -> 输出: 1x1x512
+└─ FC 512->1000                            -> 输出: 1000 类概率
+</pre>
+</div>
+
+<!-- ═══ 阶段1 ═══ -->
+<h2>阶段1: 模型加载 — 磁盘文件 -> 内存图结构</h2>
+
+<div class="diagram">
+<img src="01-load.png" alt="模型加载流程">
+</div>
+
+<div class="card">
+<h4>关键数据变换</h4>
+<table>
+<tr><th>操作</th><th>输入</th><th>输出</th><th>ResNet18 数据量</th></tr>
+<tr><td>FileLoader::load</td><td>.mnn 文件</td><td>char* buf</td><td>~45 MB (含权重)</td></tr>
+<tr><td>GetNet(buf)</td><td>char* buf</td><td>Net* 指针</td><td>零拷贝, 无内存复制</td></tr>
+<tr><td>oplist()</td><td>Net*</td><td>Op*[]</td><td>51 个算子</td></tr>
+<tr><td>tensorName()</td><td>Net*</td><td>string[]</td><td>~60 个 Tensor</td></tr>
+</table>
+</div>
+
+<!-- ═══ 阶段2 ═══ -->
+<h2>阶段2: Session 创建 — Schedule 切分</h2>
+
+<div class="diagram">
+<img src="02-session.png" alt="Session创建流程">
+</div>
+
+<div class="card green">
+<h4>ResNet18 Tensor 映射表 (部分)</h4>
+<pre>ID  形状(NC4HW4)        名称                   类型     后端
+──────────────────────────────────────────────────────────
+0   [1,1,224,224,4]     input                  INPUT    CPU
+1   [1,16,56,56,4]      conv1_output           NORMAL   CPU
+...                     ...                    ...      ...
+50  [1,1,1,1000]        fc_output              OUTPUT   CPU
+</pre>
+</div>
+
+<!-- ═══ 阶段3 ═══ -->
+<h2>阶段3: resize — 形状推导 + 算子分解 + 内存分配</h2>
+
+<h3>3.1 encode: Conv 分解为 Im2Col + MatMul</h3>
+
+<div class="diagram">
+<img src="03-conv.png" alt="Conv分解图">
+</div>
+
+<div class="card green">
+<h4>Conv1 分解后的数据流</h4>
+<pre>原始 Op:
+  OpType = Conv2D, kernel=7, stride=2, pad=3, 3->64
+
+分解为 3 个 Command:
+  [0] Im2Col:
+      输入 [1,1,224,224,4] -> turnIm2ColToBlitInfo -> MNNPackC4ForMatMul_A
+      输出 packed矩阵 (eP=16, lP=196: 7x7x4)
+      数据搬运: 196 次 NEON ld1/st1/transpose / tile
+
+  [1] MatMul:
+      weight [64x196] x packed [196x16] -> output [64x16]
+      NEON fmla 指令, 一次 4x4 外积
+
+  [2] BiasAdd:
+      output [64x16] + bias [64]
+
+执行 196 个 tile (56x56/16) 完成全部 Conv1</pre>
+</div>
+
+<h3>3.2 allocMemory: useCount 内存复用</h3>
+<div class="card orange">
+<pre>Conv1 命令组的 useCount 跟踪:
+  Im2Col(input) -> tmp1                 useCount: input=1, tmp1=1
+  MatMul(tmp1, weight) -> conv_out      tmp1=2, conv_out=1
+  MatMul onResize 后                    tmp1=1 (Im2Col 已消费)
+  BiasAdd(conv_out, bias) -> bn_input   conv_out=2, bn_input=1
+  BiasAdd onResize 后                   conv_out=1
+
+所有 Command 完成后:                tmp1=0 -> mem=nullptr (回收)
+                                      conv_out=0 -> mem=nullptr (回收)
+峰值内存 = 最大同时存活 Tensor = Conv1 的 Im2Col/MatMul 中间结果</pre>
+</div>
+
+<!-- ═══ 阶段4 ═══ -->
+<h2>阶段4: 推理执行 — 数据流动全过程</h2>
+
+<div class="card blue">
+<h4>输入: HWC -> NC4HW4 转换</h4>
+<pre>用户输入 [1,3,224,224]:            NC4HW4 [1,1,224,224,4]:
+  R R R ...                          R G B 0  R G B 0 ...
+  G G G ...                          3->4 通道补零
+  B B B ...                          copyFromHostTensor 拷贝
+</pre>
+</div>
+
+<h3>完整推理流水线</h3>
+<div class="diagram">
+<img src="04-pipeline.png" alt="推理流水线">
+</div>
+
+<h3>各层数据规格</h3>
+<div class="card">
+<pre>阶段         逻辑形状            NC4HW4 形状        内存大小    浮点运算
+────────────────────────────────────────────────────────────────────
+Input       [1,3,224,224]      [1,1,224,224,4]     0.8 MB     -
+Conv1       [1,64,56,56]       [1,16,56,56,4]      0.8 MB     118 MF
+BN+ReLU     [1,64,56,56]       [1,16,56,56,4]      0.8 MB     0.2 MF
+MaxPool     [1,64,28,28]       [1,16,28,28,4]      0.2 MB     0.1 MF
+Layer1      [1,64,28,28]x4     [1,16,28,28,4]      0.2 MBx4   ~80 MF
+Layer2      [1,128,14,14]x4    [1,32,14,14,4]      0.1 MBx4   ~180 MF
+Layer3      [1,256,7,7]x4      [1,64,7,7,4]        0.05 MBx4  ~90 MF
+Layer4      [1,512,7,7]x4      [1,128,7,7,4]       0.05 MBx4  ~50 MF
+AvgPool     [1,512,1,1]        [1,128,1,1,4]       0.002 MB   -
+FC          [1,1000]           [1,1,1,1000]        0.004 MB   1 MF
+总计        -                  -                    峰值~1.2M  1.8 GF
+</pre>
+</div>
+
+<!-- ═══ 完整数据流转 ═══ -->
+<h2>MNN 完整数据流转图</h2>
+<div class="diagram">
+<img src="05-overview.png" alt="MNN完整数据流转">
+</div>
+
+<!-- ═══ Conv 细节 ═══ -->
+<h2>核心: Im2Col + MatMul 数据追踪</h2>
+<div class="card">
+<pre>// Conv1 第一个 tile (eP=16 个输出点)
+Step 1: turnIm2ColToBlitInfo(start=0, xC=16)
+  -> 输出窗 oy=0, ox=0~15
+  -> 窗大小: 7x7x4 = 196 float/窗
+  -> srcPtr[0..15] 指向 16 个窗的起始地址
+  -> el[0..15] 包含: 有效长度, 通道数, 输出偏移
+
+Step 2: MNNPackC4ForMatMul_A
+  -> 加载 16 窗 x 196 float (NC4HW4 格式)
+  -> NEON ld1/trn1/stp: 数据重排为连续矩阵
+  -> 输出 packed [16 x 196]
+
+Step 3: MNNPackedMatMul
+  -> weight [64 x 196] x packed [196 x 16]
+  -> NEON fmla 外积, 分 64/4=16 输出组
+  -> 输出 [64 x 16] 写入 NC4HW4
+
+Step 4: 下一个 tile ... 共 56x56/16 = 196 个 tile
+总 Im2Col 调用: 196 次
+总浮点: 196 x 16 x 64 x 196 = 118 MFLOPS
+</pre>
+</div>
+
+<!-- ═══ 面试要点 ═══ -->
+<h2>面试要点</h2>
+<div class="card green">
+<ol>
+<li><strong>NC4HW4 是 MNN 最核心的数据布局</strong> — 所有数据进入引擎立即转换, 贯穿全流程</li>
+<li><strong>Im2Col+GEMM 是所有 Conv 的标准路径</strong> — 几何分解在 encode 完成, 执行时只做数据重排和矩阵乘法</li>
+<li><strong>useCount 驱动内存复用</strong> — ResNet18 峰值内存 ~ 1.2 MB, 远小于全部分配的 6 MB+</li>
+<li><strong>CONSTANT 折叠</strong> — BN 的 mean/var 在 encode 阶段与权重融合, execute 时直接跳过</li>
+<li><strong>DIRECT vs INDIRECT</strong> — CPU 后端即时计算, GPU 后端录制后批量提交</li>
+</ol>
+</div>
+
+<div class="footer">基于 MNN 源码分析 | ResNet18 示例 | 2026-06-03</div>
+
+</div>
+</body>
+</html>

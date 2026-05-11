@@ -1,0 +1,22 @@
+flowchart TD
+    classDef input fill:#4361ee,color:#fff
+    classDef conv fill:#e07a00,color:#fff
+    classDef act fill:#2d6a4f,color:#fff
+    classDef pool fill:#7c3aed,color:#fff
+    classDef fc fill:#089aa0,color:#fff
+    classDef output fill:#dc3545,color:#fff
+    IN["输入: 224x224x3"]:::input
+    C1["Conv1 7x7 S2 3->64"]:::conv
+    BN["BN+ReLU"]:::act
+    MP["MaxPool 3x3 S2"]:::pool
+    L1["Layer1 Conv 64chx4"]:::conv
+    L2["Layer2 Conv 128chx4"]:::conv
+    L3["Layer3 Conv 256chx4"]:::conv
+    L4["Layer4 Conv 512chx4"]:::conv
+    AP["AvgPool 7x7"]:::pool
+    FC["FC 512->1000"]:::fc
+    OUT["输出: 1000类"]:::output
+    S["短接残差"]:::act
+    IN-->C1-->BN-->MP-->L1-->L2-->L3-->L4-->AP-->FC-->OUT
+    MP-.->S
+    S-->L1

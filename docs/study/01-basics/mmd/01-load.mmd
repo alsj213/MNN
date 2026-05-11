@@ -1,0 +1,6 @@
+flowchart LR
+    A["model.mnn 文件磁盘"]
+    B["FileLoader 读文件头"]
+    C["GetNet(buf) 零拷贝"]
+    D["Net: Op + Tensor + Blob"]
+    A-->B-->C-->D

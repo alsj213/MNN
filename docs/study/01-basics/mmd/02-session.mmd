@@ -1,0 +1,9 @@
+flowchart TB
+    N["Net 51个Op + Tensor索引"]
+    S1["createRuntime CPU工厂"]
+    S2["initConstTensors 权重加载"]
+    S3["initTensors 全图 Tensor 映射"]
+    S4["_scheduleUnit Path 切分子图"]
+    S5["常量折叠 权重融合"]
+    PI["PipelineInfo: BackendCache + OpCacheInfo"]
+    N-->S1-->S2-->S3-->S4-->S5-->PI

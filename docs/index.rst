@@ -83,6 +83,12 @@ MNN 是一个高效、轻量的深度学习推理引擎，支持 CNN / Transform
 
 .. toctree::
    :maxdepth: 1
+   :caption: 源码学习路线
+
+   roadmap
+
+.. toctree::
+   :maxdepth: 1
    :caption: 贡献指南
 
    contribute/code

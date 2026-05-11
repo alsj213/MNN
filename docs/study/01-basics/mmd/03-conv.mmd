@@ -1,0 +1,6 @@
+flowchart LR
+    C["Conv 7x7 S2, 3->64<br/>1个Op"]-->GC["GeometryComputer"]
+    GC-->I["Im2Col<br/>提取卷积窗"]
+    GC-->M["MatMul<br/>矩阵乘法"]
+    GC-->B["BiasAdd<br/>加偏置"]
+    I-->M

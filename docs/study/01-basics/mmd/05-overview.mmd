@@ -1,0 +1,27 @@
+flowchart TB
+    subgraph 模型加载
+        A["model.mnn 磁盘"]-->B["FlatBuffers 零拷贝"]
+        B-->C["Interpreter: Net + Op"]
+    end
+    subgraph Session创建
+        D["createSession"]-->E["Schedule::schedule"]
+        E-->F["Session: mPipelines"]
+    end
+    subgraph resize
+        G["resizeSession"]-->H["encode: 形状+分解"]
+        H-->I["allocMemory: 创建+内存"]
+    end
+    subgraph 推理执行
+        J["runSession"]-->K["_copyInputs NC4HW4"]
+        K-->L["Conv: Im2Col+MatMul"]
+        L-->M["Activation: BN+ReLU"]
+        M-->N["Pooling"]
+        N-->O["更多层..."]
+        O-->P["FC: MatMul"]
+        P-->Q["输出 Tensor"]
+    end
+    C-->D; F-->G; I-->J
+    style 模型加载 fill:#3a3a5a,stroke:#4361ee,stroke-width:2
+    style Session创建 fill:#3a3a5a,stroke:#7c3aed,stroke-width:2
+    style resize fill:#3a3a5a,stroke:#2d6a4f,stroke-width:2
+    style 推理执行 fill:#3a3a5a,stroke:#e07a00,stroke-width:2

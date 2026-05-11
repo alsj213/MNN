@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Im2Col+GEMM — MNN 学习</title><link rel="stylesheet" href="../../../mnn.css"></head>
+<body>
+<div class="study-container">
+<div class="nav"><a href="../index.html">← CNN 总览</a><span>01 / Im2Col+GEMM</span></div>
+<h1>Im2Col + GEMM — 卷积 → 矩阵乘法</h1>
+<p class="status-tag now">学习中</p>
+
+<h2>完整调用链</h2>
+<pre>Session::run()
+  └─ Pipeline::execute()
+       └─ DenseConvolutionTiledImpl::onExecute(inputs, outputs)
+            └─ MNN_CONCURRENCY_ENQUEUE(mFunction)
+                 │  mFunction = onResize 时构建的 lambda
+                 │
+                 └─ for tile in tileCount:
+                      ├─ turnIm2ColToBlitInfo ──→ srcPtr[], el[]  (索引数组, 0 FLOP)
+                      ├─ MNNPackC4ForMatMul_A  ──→ packed A[16, K] (NEON 重排)
+                      └─ MNNPackedMatMul       ──→ C[16, oc]       (NEON fmla)</pre>
+
+<h2>核心三阶段</h2>
+
+<h3>Stage 1 — turnIm2ColToBlitInfo: 只算索引, 不搬数据</h3>
+<pre>// ConvolutionTiledExecutor.cpp:154
+// 输入: Im2ColParameter p (卷积参数), start (起始窗), xC (窗数)
+// 输出: srcPtr[] (每个窗的源地址), el[] (每个窗的长度/偏移/通道信息)
+
+static pair&lt;int,bool&gt; turnIm2ColToBlitInfo(
+    float const ** srcPtr,  // 输出: 每个有效块的源地址
+    int32_t* el,            // 输出: [有效长度, icup4, eOffset, lOffset] ×4
+    int start, int xC,      // 从第 start 个输出窗开始, 共 xC 个窗 (取 eP 个)
+    const Im2ColParameter& p, const uint8_t* srcOrigin, int bytes) {
+
+    int oyBegin = start / p.ow;          // 起始窗所在行
+    int oxBegin = start % p.ow;          // 起始窗所在列
+    int oyEnd   = (start + xC - 1) / p.ow;
+    int remain  = xC;
+    int number  = 0;                     // 有效块计数
+
+    for (int oyb = oyBegin; oyb &lt;= oyEnd; ++oyb) {
+        int step = min(p.ow - oxBegin, remain);
+        int oy   = oyb % p.oh;
+        int sySta = oy * p.strideY - p.padY;  // 源 Y 起始位置
+
+        // 计算 kernel Y 方向的有效范围 (处理 padding 越界)
+        int kyStart = max(0, UP_DIV(-sySta, p.dilateY));
+        int kyEnd   = min(p.kernelY, UP_DIV(p.ih - sySta, p.dilateY));
+
+        for (int ky = kyStart; ky &lt; kyEnd; ++ky) {
+            for (int kx = 0; kx &lt; p.kernelX; ++kx) {
+                // 计算 x 方向的有效范围
+                int end = min(step,
+                    (p.iw - oxBegin * p.strideX - p.dilateX * kx + p.padX + p.strideX - 1) / p.strideX);
+                int sta = max(0,
+                    UP_DIV((p.padX - oxBegin * p.strideX - p.dilateX * kx), p.strideX));
+
+                if (end > sta) {
+                    // ★ 核心: 只存地址, 不拷贝数据
+                    srcPtr[number]     = (const float*)srcKx;
+                    el[4*number + 0]   = end - sta;   // 有效长度
+                    el[4*number + 1]   = p.icup4;     // 通道数
+                    el[4*number + 2]   = eStart + sta;// 输出偏移
+                    el[4*number + 3]   = lOffset;     // K 维偏移
+                    number++;
+                }
+            }
+        }
+        oxBegin = 0;  // 换行后从列 0 开始
+        remain -= step;
+    }
+    return {number, needZero};  // needZero: 是否有 padding 需要填零
+}</pre>
+
+<h3>直观理解：一个 3×3 卷积窗上的 9 个 kernel 位置</h3>
+<pre>输入 224×224, 窗(oy=0, ox=0), kernel=3×3:
+
+  sySta = 0*2 - 1 = -1  (上边界越界)
+  kyStart = max(0, UP_DIV(1,1)) = 1   → 跳过 kx=0 那一行 (padding)
+  kyEnd   = min(3, UP_DIV(224-(-1),1)) = 3
+
+  ky=1 (中心行):
+    kx=0: sySta=-1, 读出 sx=-1+0=-1 越界 →
+          sta=max(0, UP_DIV(1-0-1*0,2))=1, end=min(step,...)
+          有效范围 [1, step), 跳过第 0 列
+    kx=1: 完全在边界内, sta=0, end=step
+    kx=2: 完全在边界内
+
+  ky=2 (底行):
+    类似分析...
+
+  turnIm2ColToBlitInfo 本质:
+    对每个 kernel 位置 (ky,kx), 计算它覆盖的 xC 个输出窗中
+    哪些是有效的 (不越界), 记录起始地址和数量
+    → 输出 srcPtr[] 和 el[] 供 Pack 阶段使用</pre>
+
+<h3>Stage 2 — MNNPackC4ForMatMul_A: NEON 汇编数据重排</h3>
+<pre>// arm64/MNNPackC4ForMatMul_A.S
+// 函数: MNNPackC4ForMatMul_A(dest, sourceGroup, info, el)
+// x0=dest, x1=sourceGroup(★多个窗口的源地址数组), x2=info, x3=el
+
+// info[0] = number   (有效块数)
+// info[1] = eReal    (实际窗数 × 4 × bytes)
+// info[2] = eDest    (打包后的行步长)
+// info[3] = xOffset  (X 偏移 × 4 × bytes)
+
+// el[4*i+0] = e      (第 i 块的有效长度)
+// el[4*i+1] = l      (通道数, icup4)
+// el[4*i+2] = eOffset(输出列偏移)
+// el[4*i+3] = lOffset(K 维偏移)
+
+// 核心: MAIN_TRANSPOSE_16x4 宏
+// 一次处理 16 个输出位置 × 4 个通道, 做 4×4 矩阵转置
+
+.macro MAIN_TRANSPOSE_16x4
+    // 加载 16 个窗口的 4 个通道数据
+    ld1 {v0.4s, v1.4s, v2.4s, v3.4s}, [x15], #64   // 窗 0~3
+    ld1 {v4.4s, v5.4s, v6.4s, v7.4s}, [x15], #64   // 窗 4~7
+    ld1 {v16.4s,v17.4s,v18.4s,v19.4s},[x15], #64   // 窗 8~11
+    ld1 {v20.4s,v21.4s,v22.4s,v23.4s},[x15], #64   // 窗 12~15
+
+    // 16 个 4×4 矩阵转置
+    transpose_4x4 v0,  v1,  v2,  v3,  v24, v25     // 窗 0~3 的 4 通道交叉
+    transpose_4x4 v4,  v5,  v6,  v7,  v24, v25     // 窗 4~7
+    transpose_4x4 v16, v17, v18, v19, v24, v25     // 窗 8~11
+    transpose_4x4 v20, v21, v22, v23, v24, v25     // 窗 12~15
+
+    // 存储到目标 buffer (连续排列)
+    stp q0,  q1,  [x0], #32
+    stp q2,  q3,  [x0], #32
+    stp q4,  q5,  [x0], #32
+    ...
+.endm</pre>
+
+<h3>Transpose 4×4 详解</h3>
+<pre>// trn1 = 取两寄存器偶数位拼成新寄存器; trn2 = 取奇数位
+
+输入 4 个寄存器, 每个存 4 个 float:
+  v0 = [a0, a1, a2, a3]    ← 窗 0 的 4 个通道
+  v1 = [b0, b1, b2, b3]    ← 窗 1 的 4 个通道
+  v2 = [c0, c1, c2, c3]    ← 窗 2 的 4 个通道
+  v3 = [d0, d1, d2, d3]    ← 窗 3 的 4 个通道
+
+Step 1: trn1 v5.4s, v0.4s, v1.4s  → v5 = [a0, b0, a2, b2]
+        trn2 v1.4s, v0.4s, v1.4s  → v1 = [a1, b1, a3, b3]
+        trn1 v6.4s, v2.4s, v3.4s  → v6 = [c0, d0, c2, d2]
+        trn2 v3.4s, v2.4s, v3.4s  → v3 = [c1, d1, c3, d3]
+
+Step 2: trn1 v0.2d, v5.2d, v6.2d  → v0 = [a0, b0, c0, d0]  ← 通道 0!
+        trn2 v2.2d, v5.2d, v6.2d  → v2 = [a2, b2, c2, d2]  ← 通道 2
+        trn1 v6.2d, v1.2d, v3.2d  → v6 = [a1, b1, c1, d1]  ← 通道 1
+        trn2 v3.2d, v1.2d, v3.2d  → v3 = [a3, b3, c3, d3]  ← 通道 3
+
+结果: 4 个窗的同一通道连在一起 → MatMul 需要的连续排列!</pre>
+
+<h3>Stage 3 — MatMul: tile 分片并行</h3>
+<pre>// DenseConvolutionTiledExecutor.cpp:539-600
+// 外层循环: tile 分片 (eP 个输出窗一批)
+
+for (int x = 0; x &lt; tileCount; x++) {
+    int start  = x * eP;                     // eP=12, 一次处理 12 个输出窗
+    int xC     = min(eP, plane - start);     // 最后一批可能少于 eP
+
+    // ① turnIm2ColToBlitInfo: 算索引
+    auto res = turnIm2ColToBlitInfo(srcPtr, el, start, xC, p, srcOrigin, bytes);
+
+    // ② Pack (多线程, 沿 K 维分片)
+    MNN_CONCURRENCY_BEGIN(tId, threadNumber) {
+        for(tic = im2colParallelSize[tId]; tic &lt; im2colParallelSize[tId+1]; tic++) {
+            packA(gemmBuffer, &source, info, threadEL);  // MNNPackC4ForMatMul_A
+        }
+    }
+    MNN_CONCURRENCY_END();
+
+    // ③ MatMul (多线程, 沿输出通道分片)
+    MNN_CONCURRENCY_BEGIN(tId, threadNumber) {
+        for (oc = ocC4ParralSize[tId]; oc &lt; ocC4ParralSize[tId+1]; oc++) {
+            matmulUnit(dst, A, weight, parameters, ...);  // MNNPackedMatMul
+        }
+    }
+    MNN_CONCURRENCY_END();
+}</pre>
+
+<h2>Im2ColParameter 全字段</h2>
+<table>
+<tr><th>字段</th><th>含义</th><th>示例值 (Conv 3×3,s=2,p=1,3→64)</th></tr>
+<tr><td>kernelX/Y</td><td>卷积核空间尺寸</td><td>3, 3</td></tr>
+<tr><td>strideX/Y</td><td>步长</td><td>2, 2</td></tr>
+<tr><td>dilateX/Y</td><td>膨胀系数</td><td>1, 1</td></tr>
+<tr><td>padX/Y</td><td>填充大小</td><td>1, 1</td></tr>
+<tr><td>iw, ih</td><td>输入宽高</td><td>224, 224</td></tr>
+<tr><td>ow, oh</td><td>输出宽高</td><td>112, 112</td></tr>
+<tr><td>icDiv4</td><td>通道组数 = UP_DIV(c, 4)</td><td>1 (3 通道占 1 组)</td></tr>
+<tr><td>ic</td><td>ROUND_UP(c, lP)</td><td>3 (lP=1)</td></tr>
+<tr><td>icup4</td><td>ROUND_UP(c, min(lP, pack))</td><td>3</td></tr>
+<tr><td>packCUnit</td><td>pack 大小</td><td>4</td></tr>
+<tr><td>srcZStep</td><td>跨 Group 步长 = stride(1)×pack×batch</td><td>50176×4×1</td></tr>
+<tr><td>srcYStep</td><td>跨行步长 = stride(2)×pack</td><td>224×4</td></tr>
+<tr><td>kernelCountUnit</td><td>INT8 专用, FP32 不用</td><td>-</td></tr>
+</table>
+
+<h2>Tile 参数 eP/lP/hP 的由来</h2>
+<pre>// CommonOptFunctionNeon.cpp:1879
+void MNNGetMatMulPackMode(int* eP, int *lP, int* hP) {
+    *eP = 12;       // 一次处理 12 个输出空间位置
+    *lP = 1;        // K 维步进单位 = 1 (FP32 逐元素累加)
+#ifdef __aarch64__
+    *hP = 8;        // 一次处理 8 个输出通道
+#else
+    *hP = 4;        // ARM32 寄存器少, 减半
+#endif
+}
+
+// 这三个值由 NEON 寄存器数量决定:
+//   ARM64 有 32 个 128-bit 寄存器 (v0~v31)
+//   每个寄存器存 4 个 float32
+//   C[eP×hP] = A[eP×K] × B[K×hP]
+//   需要: eP×hP + eP + hP ≈ 12×8+12+8 = 116 个寄存器 ≈ 29 个 NEON 寄存器
+//   刚好在 32 个寄存器限制内</pre>
+
+<h2>一次 MatMul micro-kernel 的计算量</h2>
+<pre>A[eP=12, K=27] × B[K=27, hP=8] → C[12, 8]
+
+  乘法: 12 × 8 × 27 = 2,592 次
+  加法: 12 × 8 × 27 ≈ 2,592 次
+  FLOPs: ≈ 5,184
+
+对于 [oh×ow=12544, oc=64] 的输出:
+  tileCount = ceil(12544/12) = 1046 次 Im2Col+Pack
+  每次 Im2Col 后, MatMul 调用 ceil(64/8) = 8 次 micro-kernel
+  总 micro-kernel 调用: 1046 × 8 = 8,368 次
+  总 MAC: 8,368 × 2,592 ≈ 21.7M MAC</pre>
+
+<h2>关键文件</h2>
+<ul>
+  <li><code>source/backend/cpu/compute/ConvolutionTiledExecutor.cpp:90</code> — setIm2ColParameter</li>
+  <li><code>source/backend/cpu/compute/ConvolutionTiledExecutor.cpp:154</code> — turnIm2ColToBlitInfo</li>
+  <li><code>source/backend/cpu/compute/DenseConvolutionTiledExecutor.cpp:424</code> — onResize (构建 mFunction)</li>
+  <li><code>source/backend/cpu/compute/DenseConvolutionTiledExecutor.cpp:720</code> — onExecute (触发线程池)</li>
+  <li><code>source/backend/cpu/arm/arm64/MNNPackC4ForMatMul_A.S</code> — NEON Pack 汇编</li>
+  <li><code>source/backend/cpu/arm/CommonOptFunctionNeon.cpp:1879</code> — MNNGetMatMulPackMode (eP/lP/hP)</li>
+  <li><code>source/core/ConvolutionCommon.hpp:44</code> — Im2ColParameter 结构体</li>
+</ul>
+
+<h2>面试重点</h2>
+
+<div class="qa">
+<div class="q">Im2Col 为什么不直接拷贝数据？</div>
+<div class="a">Im2Col 只需要每个窗口的起始地址 (srcPtr) 和有效范围 (el)，不需要实际拷贝。地址计算是 O(1) 的指针运算。真正的数据搬移和重排由后续的 Pack (MNNPackC4ForMatMul_A) 完成，Pack 阶段才会 ld1 加载 + transpose + stp 存回。</div>
+</div>
+
+<div class="qa">
+<div class="q">turnIm2ColToBlitInfo 的 el[] 数组含义？</div>
+<div class="a">el 是一个 int32 数组，每 4 个一组：[有效长度, 通道数(icup4), 输出列偏移(eOffset), K维偏移(lOffset)]。srcPtr[number] 指向该 block 的源地址。el 告诉 Pack 阶段要读多少个连续元素、写到目标 buffer 的哪个位置。</div>
+</div>
+
+<div class="qa">
+<div class="q">为什么需要 transpose_4x4？</div>
+<div class="a">NC4HW4 格式下，相邻 4 个输出位置的相同通道是不连续的（被 pack 分隔了）。GEMM 需要 A 矩阵按 K 维连续存放。transpose_4x4 把 4 个窗 × 4 通道的 4×4 小块转置，使同一通道的值连在一起，满足 MatMul 的内存连续性要求。</div>
+</div>
+
+<div class="qa">
+<div class="q">Im2Col 的 needZero 标记怎么处理？</div>
+<div class="a">当窗口部分越界（padding 区域），越界部分会缺少有效的 el 记录（kyStart>0 或 kxStart>0）。needZero=true 时，Pack 前先把 gemmBuffer 清零，Pack 只填有效部分，越界位置自动保持为零——等价于 zero-padding 的效果。</div>
+</div>
+
+<h2>深度总结</h2>
+<div class="checklist">
+<div class="checklist-item done">✅ turnIm2ColToBlitInfo: 遍历 (oy,ox) 窗口 + (ky,kx) kernel 位置, 算 srcPtr[] + el[], 0 FLOP 纯索引</div>
+<div class="checklist-item done">✅ MNNPackC4ForMatMul_A: NEON ld1→trn1/trn2→stp, 将 NC4HW4 转为 MatMul 连续矩阵</div>
+<div class="checklist-item done">✅ transpose_4x4: 4 窗 × 4 通道转置, trn1.4s + trn1.2d 实现</div>
+<div class="checklist-item done">✅ eP=12, lP=1, hP=8: 由 NEON 寄存器数量决定, ARM64 32 个 128bit 寄存器限制</div>
+<div class="checklist-item done">✅ onResize 构建 mFunction: Im2Col 按空间分片 + MatMul 按输出通道分片, 双重线程并行</div>
+<div class="checklist-item done">✅ needZero: padding 区域自动填零, 无需额外 padding 层</div>
+</div>
+
+<div class="footer">2026-06-07</div>
+</div>
+</body>
+</html>

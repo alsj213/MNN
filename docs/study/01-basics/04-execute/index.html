@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>推理执行 — MNN 学习</title><link rel="stylesheet" href="../../../mnn.css"></head>
+<body>
+<div class="study-container">
+<div class="nav"><a href="../../../mnn.html">← 返回总览</a><span>04 / 推理执行</span></div>
+<h1>推理执行 — runSession 调用链</h1>
+<p class="status-tag now">学习中</p>
+
+<h2>完整调用链</h2>
+<pre>Interpreter::runSession(session)
+  │  mutex lock
+  │  _runSessionBegin()  → 各 Runtime::onConcurrencyBegin()
+  │
+  └─ Session::run()
+       │  if (mNeedResize) → return COMPUTE_SIZE_ERROR
+       │
+       └─ for each Pipeline (按 config 顺序):
+             └─ Pipeline::execute()
+                  ├─ _copyInputs()        ← 用户输入 → device 内存
+                  ├─ _enterExecute()      ← Backend::onExecuteBegin()
+                  │                          GPU: 开始 command buffer 录制
+                  ├─ for each OpCacheInfo:
+                  │    └─ for each Command:
+                  │         └─ Execution::onExecute(workInputs, workOutputs)
+                  └─ _exitExecute()       ← Backend::onExecuteEnd()
+                                               GPU: 提交 command buffer</pre>
+
+<h2>逐层拆解</h2>
+
+<h3>Interpreter::runSession</h3>
+<pre>// Interpreter.cpp:426
+ErrorCode Interpreter::runSession(Session* session) const {
+    std::unique_lock&lt;std::mutex&gt; _l(mNet-&gt;lock);
+    _runSessionBegin(session);   // for each Runtime → onConcurrencyBegin()
+    ErrorCode errorcode = session-&gt;run();
+    _runSessionEnd(session);     // for each Runtime → onConcurrencyEnd()
+    return errorcode;
+}</pre>
+
+<h3>Session::run</h3>
+<pre>// Session.cpp:243
+ErrorCode Session::run() const {
+    if (mNeedResize) return COMPUTE_SIZE_ERROR;  // 检查 resize
+    for (auto&amp; iter : mPipelines) {              // 依次执行每个 Pipeline
+        auto error = iter-&gt;execute();
+        if (NO_ERROR != error) return error;
+    }
+    return NO_ERROR;
+}</pre>
+
+<h3>Pipeline::execute</h3>
+<pre>// Pipeline.cpp:1160
+ErrorCode Pipeline::execute() {
+    _copyInputs();          // ① 拷贝用户输入
+    auto enterCode = _enterExecute();
+    if (NO_ERROR != enterCode) return enterCode;
+
+    // ② 逐 Command 执行
+    for (auto&amp; info : mInfo.second) {
+        if (info.type == CONSTANT) continue;  // 跳过常量
+        for (int i=0; i&lt;buffer.command.size(); ++i) {
+            auto&amp; cmd = *buffer.command[i];
+            auto code = cmd.execution-&gt;onExecute(
+                cmd.workInputs, cmd.workOutputs);
+            if (NO_ERROR != code) {
+                _exitExecute();
+                return code;
+            }
+        }
+    }
+    _exitExecute();          // ③ 后端执行结束
+    return NO_ERROR;
+}</pre>
+
+<h2>四个关键步骤</h2>
+
+<h3>Step 1: _copyInputs</h3>
+<pre>void Pipeline::_copyInputs() {
+    // 遍历 inputTensorCopyCache（_InsertCopy 时建立）
+    for (auto&amp; iter : inputTensorCopyCache) {
+        auto&amp; cache = iter.second;
+        if (nullptr == std::get&lt;0&gt;(cache)) continue;  // 无 wrap
+        if (!std::get&lt;3&gt;(cache)) continue;            // 脏标记=false
+
+        // 用户 Tensor → 设备 Tensor
+        std::get&lt;0&gt;(cache)-&gt;copyFromHostTensor(iter.first);
+        std::get&lt;3&gt;(cache) = false;  // 清脏
+    }
+}</pre>
+
+<h3>Step 2 &amp; 4: _enterExecute / _exitExecute</h3>
+<pre>ErrorCode Pipeline::_enterExecute() {
+    mBackend-&gt;onExecuteBegin();       // GPU: 开始录制 command buffer
+    mBackupBackend-&gt;onExecuteBegin(); // CPU: 空操作
+    return NO_ERROR;
+}
+void Pipeline::_exitExecute() {
+    mBackupBackend-&gt;onExecuteEnd();
+    mBackend-&gt;onExecuteEnd();         // GPU: 提交 command buffer 到队列
+}</pre>
+
+<h3>Step 3: Execution::onExecute — 真正的计算</h3>
+<pre>// 纯虚函数，每个后端各 Op 各自实现
+virtual ErrorCode onExecute(inputs, outputs) = 0;
+
+// CPU BinaryOp 示例 (CPUBinary.cpp:82):
+ErrorCode CPUBinary::onExecute(inputs, outputs) {
+    // 读 host 指针
+    auto input0Ptr = inputs[0]-&gt;host&lt;uint8_t&gt;();
+    auto input1Ptr = inputs[1]-&gt;host&lt;uint8_t&gt;();
+    auto outputPtr = outputs[0]-&gt;host&lt;uint8_t&gt;();
+
+    // 多线程并行执行
+    MNN_CONCURRENCY_ENQUEUE(mTask);
+    // mTask: 按线程分块，每块执行 mProc(out, in0, in1, size)
+    // mProc 在 onResize 时选定:
+    //   ADD → BinaryAdd, MUL → BinaryMul, ...
+    return NO_ERROR;
+}
+
+// CPU Raster 示例 (CPURaster.cpp:714):
+ErrorCode CPURaster::onExecute(inputs, outputs) {
+    // 遍历 Region，并行 memcpy
+    for (auto&amp; task : mTasks) {
+        MNN_CONCURRENCY_ENQUEUE(task);
+    }
+    // mTask: for each Region → _blit(slice, bytes, srcPtr, dstPtr)
+    return NO_ERROR;
+}</pre>
+
+<h2>GPU 后端执行对比</h2>
+<pre>CPU 后端                           GPU 后端 (OpenCL)
+─────                             ───────────
+_copyInputs: memcpy               _copyInputs: host→device
+_enterExecute:                     _enterExecute:
+  resetDynamicMemory()              开始录制 command buffer
+  (CPUBackend.cpp:532)            (OpenCLBackend::onExecuteBegin)
+
+onExecute (DIRECT):              onExecute (INDIRECT):
+  即时在当前线程/线程池执行          只是添加 kernel launch 到 cmd buffer
+  CPUBinary::onExecute:             OPENCL 每个 Op 的 onExecute:
+    MNN_CONCURRENCY_ENQUEUE          clSetKernelArg + clEnqueueNDRangeKernel
+    等待线程池完成后返回              → 只推命令, 不等待
+
+_exitExecute:                    _exitExecute:
+  (空操作)                          提交 cmd buffer, 等待所有 kernel 完成
+  CPUBackend::onExecuteEnd         (OpenCLBackend::onExecuteEnd)
+  (CPUBackend.cpp:537)              → clFinish / clFlush</pre>
+
+<h3>INDIRECT 模式详解</h3>
+<pre>// Backend::Info::Mode (Backend.hpp:103)
+enum Mode {
+    DIRECT = 0,    // onExecute 直接计算 (CPU)
+    INDIRECT = 1   // onExecute 录制, onExecuteBegin/End 提交/等待 (GPU)
+};
+
+MNN 的 GPU 后端 (OpenCL/Metal/Vulkan) 使用 INDIRECT 模式;
+CPU 后端使用 DIRECT 模式.
+好处: GPU 可以批量提交 kernel, 减少 CPU-GPU 同步开销.</pre>
+
+<h2>CPU 线程池调度机制</h2>
+
+<h3>MNN_CONCURRENCY_ENQUEUE 宏 (Concurrency.h:15)</h3>
+<pre>// 取决于编译选项, 有 4 种实现:
+//
+// Android (默认):     OpenMP (omp parallel for)
+// iOS / macOS:        dispatch_apply (GCD)
+// Windows:            omp.h (MSCV)
+// MNN_USE_THREAD_POOL: 自研线程池 (ThreadPool.hpp)
+
+#ifdef MNN_USE_THREAD_POOL
+#define MNN_CONCURRENCY_ENQUEUE(task) ((CPUBackend*)backend())->enqueue(task)
+#elif defined(__APPLE__)
+#define MNN_CONCURRENCY_ENQUEUE(task) \
+    dispatch_apply(task.second, dispatch_get_global_queue(...), ^(size_t i) {task.first(i);});
+#else // Android 默认
+#define MNN_CONCURRENCY_ENQUEUE(task) \
+    _Pragma("omp parallel for") for (int i = 0; i &lt; task.second; i++) {task.first(i);}
+#endif</pre>
+
+<h3>MNN_USE_THREAD_POOL 自研线程池 (ThreadPool.cpp:121)</h3>
+<pre>void ThreadPool::enqueue(TASK* taskp, int index) {
+    auto&amp; task = *taskp;
+    // 单线程: 直接串行
+    if (1 &gt;= task.second || 0 &gt; index) {
+        for (int i = 0; i &lt; task.second; ++i) task.first(i);
+        return;
+    }
+    enqueueInternal(taskp, index);
+}
+
+void ThreadPool::enqueueInternal(TASK* taskp, int index) {
+    // workSize &gt; threadNumber: 循环分片, 每个线程处理一部分
+    //   "for (int v = tId; v &lt; workSize; v += mNumberThread)"
+    // 工作线程通过 condition_variable 唤醒
+    // 主线程: task.first(0) + busy-wait 等所有线程完成
+}</pre>
+
+<pre>TASK = std::pair&lt;std::function&lt;void(int)&gt;, int&gt;
+  first:  函数对象 (参数: 线程 ID)
+  second: 任务片数 (= 线程数)</pre>
+
+<h2>CPU 卷积执行 — 完整链路深度分析</h2>
+
+<h3>调用链</h3>
+<pre>Session::run()
+  └─ Pipeline::execute()
+       └─ DenseConvolutionTiledImpl::onExecute(inputs, outputs)
+            └─ MNN_CONCURRENCY_ENQUEUE(mFunction)
+                 └─ CPUBackend::enqueue(task)       // CPUBackend.hpp:179
+                      └─ ThreadPool::enqueue(&amp;task)  // ThreadPool.cpp:121</pre>
+
+<h3>mFunction 的构建 (onResize 时): 3 层并行</h3>
+<pre>// DenseConvolutionTiledExecutor.cpp:424-716 (onResize 阶段就准备好)
+
+// Step 1: 计算线程数和分片参数
+int threadNumber = ((CPUBackend*)backend())->threadNumber();
+mFunction.second = threadNumber;  // 任务片数 = 线程数
+
+// Step 2: Im2Col + Pack (将图像拉成矩阵并打包成 MatMul 格式)
+//   for 每个 tile (eP 个像素一组):
+//     按线程分: MNN_CONCURRENCY_BEGIN(tId, threadNumber)
+//       packA() 把 im2col 结果打包为连续内存
+
+// Step 3: MatMul (每个线程处理若干输出通道)
+//   for 每个 tile:
+//     MNN_CONCURRENCY_BEGIN(tId, threadNumber)
+//       for t_oc from ocC4ParralSize[tId] to ocC4ParralSize[tId+1]:
+//         对 ocIndex 输出通道执行 matmulUnit(dst, gemm, weight, ...)
+//         → 实质是 ARM NEON 的 MNNPackedMatMul
+
+// 线程分片: Im2Col 按空间位置分片, MatMul 按输出通道分片</pre>
+
+<h3>关键: mFunction 在 onResize 时就准备好了</h3>
+<pre>多线程的 "如何分片" 在 onResize 阶段确定:
+  - threadNumber 固定
+  - ocC4ParralSize / im2colParallelSize 提前算好分界线
+  - mFunction.first = [=](int tId) { ... };  // lambda, 捕获所有参数
+  - onExecute 只是触发线程池调度: MNN_CONCURRENCY_ENQUEUE(mFunction)
+
+因此 onResize 负责 "怎么算", onExecute 负责 "开算".
+这就是 encode/allocMemory 两阶段分离在 Op 级别的体现!</pre>
+
+<h2>Debug 模式</h2>
+<pre>// Pipeline.cpp:1225
+ErrorCode Pipeline::executeCallBack(const TensorCallBackWithInfo&amp; before,
+                                    const TensorCallBackWithInfo&amp; after) {
+    _copyInputs();
+    _enterExecute();
+    for (auto&amp; info : mInfo.second) {
+        if (info.type == CONSTANT) continue;
+        for (auto cmd : buffer.command) {
+            if (nullptr == cmd-&gt;info.get()) {
+                cmd-&gt;execution-&gt;onExecute(...);
+                continue;  // 无 info 的直接执行 (内部 Command)
+            }
+            auto run = before(cmd-&gt;workInputs, cmd-&gt;info.get());
+            if (run) {
+                cmd-&gt;execution-&gt;onExecute(cmd-&gt;workInputs, cmd-&gt;workOutputs);
+            }
+            auto stop = !(after(cmd-&gt;workOutputs, cmd-&gt;info.get()));
+            if (stop) { _exitExecute(); return CALL_BACK_STOP; }
+        }
+    }
+    _exitExecute();
+}</pre>
+
+<pre>// 使用场景:
+// before(tensors, info): 每层执行前调用, return false 可跳过该层
+// after(tensors, info):  每层执行后调用, return false 可停止推理
+// 用于: 打印中间结果, 逐层 profiling, 条件提前退出</pre>
+
+<h2>Session 并发安全模型</h2>
+<pre>// Interpreter.cpp:426
+ErrorCode Interpreter::runSession(Session* session) const {
+    std::unique_lock&lt;std::mutex&gt; _l(mNet->lock);  // 同一 Interpreter 串行
+    _runSessionBegin(session);   // Runtime::onConcurrencyBegin
+    ErrorCode code = session->run();
+    _runSessionEnd(session);     // Runtime::onConcurrencyEnd
+    return code;
+}</pre>
+
+<table>
+<tr><th>操作</th><th>锁</th><th>说明</th></tr>
+<tr><td>createSession</td><td>mNet-&gt;lock (mutex)</td><td>写模型图, 互斥</td></tr>
+<tr><td>resizeSession</td><td>mNet-&gt;lock (mutex)</td><td>写 Session 状态, 互斥</td></tr>
+<tr><td>runSession</td><td>mNet-&gt;lock (mutex)</td><td>同 Interpreter 实例串行</td></tr>
+<tr><td>不同 Session 并发 run</td><td>无锁</td><td>各 Session 独立 Pipeline/Tensor</td></tr>
+</table>
+
+<h2>执行流程的关键设计</h2>
+
+<h3>为什么 onResize 和 onExecute 分离?</h3>
+<pre>encode/allocMemory 两阶段分离在 Op 级别同样适用:
+  • onResize = allocMemory 阶段调用
+    确定: 输入输出形状、数据布局(NC4HW4)、线程分片、临时缓冲区
+  • onExecute = execute 阶段调用
+    执行: workInputs → workOutputs 的实际计算
+
+例: 卷积的 onResize 做了:
+  1. 解析卷积参数 (Kernel/Stride/Padding)
+  2. 确定 Im2Col 参数: eP, lP, hP
+  3. 构建 mFunction lambda (线程分片 + MatMul 函数指针选择)
+  → onExecute 只需要: MNN_CONCURRENCY_ENQUEUE(mFunction)</pre>
+
+<h3>DIRECT vs INDIRECT 模式</h3>
+<pre>CPU 后端 (DIRECT):              GPU 后端 (INDIRECT):
+─────────────────              ───────────────────
+onExecute → 立即计算           onExecute → 录制到 cmd buffer
+返回时结果可读                 返回时未执行, 结果不可读
+                               onExecuteEnd → 批量提交 + 等待
+                               → onExecuteEnd 后结果才可读</pre>
+
+<h3>线程池 vs OpenMP vs GCD</h3>
+<pre>MNN 根据平台选择最优的并行方案:
+  • Android (OpenMP):    _Pragma("omp parallel for")
+  • iOS/macOS (GCD):     dispatch_apply
+  • ThreadPool 模式:     自研, 无锁等待 + 循环分片
+  • 单线程模式:          MNN_FORBID_MULTI_THREADS</pre>
+
+<h2>关键文件</h2>
+<ul>
+  <li><code>source/core/Interpreter.cpp:426</code> — Interpreter::runSession</li>
+  <li><code>source/core/Session.cpp:243</code> — Session::run</li>
+  <li><code>source/core/Pipeline.cpp:1160</code> — Pipeline::execute</li>
+  <li><code>source/core/Pipeline.cpp:1147</code> — _copyInputs</li>
+  <li><code>source/core/Pipeline.cpp:1205</code> — _enterExecute / _exitExecute</li>
+  <li><code>source/core/Pipeline.cpp:1225</code> — executeCallBack (debug 回调)</li>
+  <li><code>source/core/Execution.hpp:55</code> — Execution 基类 onExecute 纯虚函数</li>
+  <li><code>source/core/Concurrency.h</code> — MNN_CONCURRENCY_ENQUEUE 4 种实现</li>
+  <li><code>source/backend/cpu/ThreadPool.cpp:121</code> — 自研线程池调度</li>
+  <li><code>source/backend/cpu/CPUBackend.hpp:179</code> — enqueue 桥接</li>
+  <li><code>source/backend/cpu/CPUBackend.cpp:532</code> — CPU onExecuteBegin</li>
+  <li><code>source/backend/cpu/compute/DenseConvolutionTiledExecutor.cpp:720</code> — 卷积执行实现</li>
+  <li><code>source/backend/cpu/CPUBinary.cpp:82</code> — BinaryOp 执行示例</li>
+  <li><code>source/backend/cpu/CPURaster.cpp:714</code> — Raster 执行示例</li>
+  <li><code>source/backend/opencl/core/OpenCLBackend.hpp:99</code> — GPU onExecuteBegin/End</li>
+</ul>
+
+<h2>面试重点</h2>
+
+<div class="qa">
+<div class="q">runSession 内部做了哪些事？</div>
+<div class="a">加锁 → onConcurrencyBegin → Session::run() 遍历 Pipeline 依次 execute → onConcurrencyEnd。Session::run 是三层循环：for each Pipeline → for each OpCacheInfo（跳过 CONSTANT）→ for each Command → Execution::onExecute()。</div>
+</div>
+
+<div class="qa">
+<div class="q">Pipeline::execute 的四个步骤？</div>
+<div class="a">① _copyInputs：用户数据拷入设备 ② _enterExecute：Backend::onExecuteBegin（GPU 开始录制）③ 逐 Command 调用 Execution::onExecute ④ _exitExecute：Backend::onExecuteEnd（GPU 提交执行）。</div>
+</div>
+
+<div class="qa">
+<div class="q">Execution::onExecute 是同步还是异步？</div>
+<div class="a">取决于后端。CPU 直接计算，返回时结果就绪。GPU 只是向 command buffer 添加 kernel launch，真正执行在 _exitExecute 提交之后。</div>
+</div>
+
+<div class="qa">
+<div class="q">多个 Session 可以并发跑吗？</div>
+<div class="a">可以。不同 Session 有自己的 Pipeline 和 Tensor，可以并发 runSession。但 createSession/releaseSession/resizeSession 通过 mutex 互斥。</div>
+</div>
+
+<div class="qa">
+<div class="q">runSessionWithCallBack 有什么用？</div>
+<div class="a">每层 Op 执行前后回调用户函数，拿到中间 Tensor 值。用于调试每层输出、profiling 耗时。Release 模式禁用。</div>
+</div>
+
+<div class="qa">
+<div class="q">CONSTANT Op 为什么跳过？</div>
+<div class="a">encode 阶段已用 CPU 算好存到 tensor 里，运行时直接读值，不需要再执行。</div>
+</div>
+
+<div class="footer">2026-05-18</div>
+</div>
+</body>
+</html>

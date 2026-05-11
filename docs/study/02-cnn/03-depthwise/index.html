@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Depthwise & Group 卷积 — MNN 学习</title><link rel="stylesheet" href="../../../mnn.css"></head>
+<body>
+<div class="study-container">
+<div class="nav"><a href="../index.html">← CNN 总览</a><span>03 / Depthwise & Group 卷积</span></div>
+<h1>深度可分离卷积 & 分组卷积</h1>
+<p class="status-tag now">深度完成</p>
+
+<h2>三种卷积类型对照</h2>
+<pre>普通卷积:  ic=3, oc=64, group=1
+          每个输出通道看所有输入通道, FLOPs ∝ ic×oc×k²
+
+深度可分离: ic=3, oc=3, group=3
+          每个输出通道只看 1 个输入通道, FLOPs ∝ ic×k²
+          (MNN: OpType_ConvolutionDepthwise 专属 NEON 内核)
+
+分组卷积:   ic=128, oc=256, group=32
+          每组 ic/g=4 输入 → oc/g=8 输出
+          (MNN: ConvolutionGroup 包裹 N 个普通卷积)</pre>
+
+<h2>深度可分离卷积: 专属 NEON 内核</h2>
+
+<h3>不做 Im2Col, 直接滑动窗口</h3>
+<pre>// CPUConvolutionDepthwise.cpp:211-236
+// 计算结构: 每个 depth quad (4 通道一组), 滑窗遍历空间
+
+for dz in [0..oc/4]:               // 输出通道 4 个一组
+  for (dy, dx) in output:          // 输出空间
+    for (ky, kx) in kernel:        // kernel 窗口
+      acc[0..3] += weight[kx,ky,dz][0..3] * input[dy+ky, dx+kx, dz][0..3]
+
+// MNN 用 unit=4 (ARM NEON 128-bit = 4×float32)
+// 每次 NEON 指令同时处理 4 个通道</pre>
+
+<h3>标准 NEON 内核: MNNConvRunForLineDepthwise.S</h3>
+<pre>// arm64/MNNConvRunForLineDepthwise.S
+// 三循环: height → width → kernel
+
+L16 (width ≥ 16 的快速路径):
+  // 初始化 16 个累加器 = bias (v16~v31)
+  assign_bias v16..v31, v8
+
+  LoopH (kernel 高度):
+    LoopW (kernel 宽度):
+      ld1 {v7.4s}, [x2], #16     ← 1 个 weight 向量 (4 个通道)
+      ld1 {v0.4s}, [x1], x4      ← pixel 0 源 (4 通道, strided load)
+      ld1 {v1.4s}, [x1], x4      ← pixel 1
+      ... 共 16 个像素
+
+      fmla v16.4s, v7.4s, v0.4s  ← 1 个 weight × 16 个像素 = 16 FMA
+      fmla v17.4s, v7.4s, v1.4s
+      ...
+
+  // 后处理: clamp + store
+  st1 {v16..v31}, [x0], #256    ← 16×4=64 float 存储
+
+★ 关键优化: 1 次 ld1 weight, 16 次 fmla, 充分复用 NEON 寄存器!</pre>
+
+<h3>快速路径: stride=1, dilation=1</h3>
+<pre>// arm64/MNNDepthwiseConvFastKernel.S
+// stride=1 时相邻输出窗口大量重叠, 可连续加载
+
+  ld1 {v8.4s}, [x2], #16             ← 1 weight
+  ld1 {v0..v3.4s}, [x1], #64        ← 4 个连续像素
+  ld1 {v4..v7.4s}, [x1], #64        ← 4 个
+  ld1 {v9..v12.4s}, [x1], #64       ← 4 个 = 12 个总共
+  // 全部 FMA
+  ld1 {v0..v3.4s}, [x1], x12        ← 回退 11 像素, 前进 1 → 滑动窗口!
+
+// 比标准路径快 ~3× (省去 strided load + 指针回绕指令)</pre>
+
+<h2>INT8 深度可分离</h2>
+<pre>// CPUDepthwiseConvInt8.cpp
+// INT8 kernel: MNNLineDepthWiseInt8AddBiasScaleUnit.S
+
+1. sxtl  v0.8h, v9.8b        // int8 → int16 (符号扩展)
+2. smlal v10.4s, v0.4h, v1.4h // int16 × int16 → int32 (累加)
+3. scvtf v10.4s, v10.4s       // int32 → float32
+4. fmul  v10.4s, v10.4s, v26.4s // × scale
+5. sqxtn → sqxtn2 → smin/smax → st1  // float→int8 量化存储
+
+// ARM82 SDOT 指令: 1 条替代步骤 1+2, 4 倍吞吐!
+// 3×3 特化: ConvDepthwise3x3LineInt8_ARM82, tbl 查表 + sdot</pre>
+
+<h2>分组卷积: ConvolutionGroup</h2>
+<pre>// ConvolutionGroup.cpp:70-102
+// 不做自己的卷积, 而是把 N 个普通卷积包起来
+
+onExecute:
+  1. MNNUnpackCUnit: NC4HW4 → NCHW (整张输入)
+  2. for each group:
+       MNNPackCUnit: NCHW → NC4HW4 (只取该 group 的通道)
+       subConvolution[group]->onExecute()  // 可能是 Im2Col/Winograd
+       MNNUnpackCUnit: NC4HW4 → NCHW (结果写回)
+  3. MNNPackCUnit: NCHW → NC4HW4 (整张输出)
+
+★ 开销: 每次 execute 做 Unpack→Pack→Unpack→Pack 四个来回
+  原因: subConvolution 期望 NC4HW4, 但 group 跨 pack 边界</pre>
+
+<h2>深度可分离 vs Im2Col+GEMM 内存模式对比</h2>
+<pre>Im2Col+GEMM:
+  Im2Col 收集: OH×OW×(kh×kw×ic) 次读  →  buffer 膨胀 kh×kw×ic×
+  GEMM: 规整的矩阵乘法, cache 友好
+  内存: 膨胀 + Pack, ~30× 输入大小
+
+Depthwise:
+  无 Im2Col, 直接从源 tensor 做 strided load
+  内存: 零膨胀, 只需 pad buffer (~src_width×pad×4bytes)
+  代价: 访存不规则, cache line 利用率低
+
+选择: group == oc == ic → 直接用 Depthwise (模型确定, 不运行时选择)</pre>
+
+<h2>关键文件</h2>
+<ul>
+  <li><code>source/backend/cpu/CPUConvolutionDepthwise.cpp</code> — FP32 depthwise (onResize L129, onExecute L241)</li>
+  <li><code>source/backend/cpu/arm/arm64/MNNConvRunForLineDepthwise.S</code> — 标准 NEON depthwise (297 行, 3 循环)</li>
+  <li><code>source/backend/cpu/arm/arm64/MNNDepthwiseConvFastKernel.S</code> — stride=1 快速路径 (293 行)</li>
+  <li><code>source/backend/cpu/CPUDepthwiseConvInt8.cpp</code> — INT8 depthwise</li>
+  <li><code>source/backend/cpu/arm/arm64/MNNLineDepthWiseInt8AddBiasScaleUnit.S</code> — INT8 NEON kernel (718 行)</li>
+  <li><code>source/backend/cpu/compute/ConvolutionGroup.cpp</code> — 分组卷积 (Unpack/Repack L70)</li>
+  <li><code>source/backend/cpu/compute/ConvolutionFloatFactory.cpp</code> — 工厂: group>1 → ConvolutionGroup (L258)</li>
+</ul>
+
+<h2>面试重点</h2>
+<div class="qa">
+<div class="q">深度可分离 vs 分组卷积的区别？</div>
+<div class="a">深度可分离: group == oc == ic, MNN 用专属 NEON 内核 (OpType_ConvolutionDepthwise), 无 Im2Col。分组卷积: group < channels, MNN 用 ConvolutionGroup 包裹 N 个普通卷积 (可能 Im2Col 或 Winograd), 加 Unpack/Repack 开销。</div>
+</div>
+<div class="qa">
+<div class="q">为什么 Depthwise 不用 Im2Col？</div>
+<div class="a">Depthwise 每个输出通道只依赖 1 个输入通道, Im2Col 膨胀比只有 k²× (vs 普通卷积的 ic×k²×)。膨胀比太小, GEMM 的优势被 Im2Col 开销抵消。直接用滑动窗口 + NEON strided load 更高效。</div>
+</div>
+<div class="qa">
+<div class="q">Depthwise 的 NEON 循环为什么处理 16 个像素？</div>
+<div class="a">ARM64 有 32 个 128-bit 寄存器 (v0~v31)。扣除 weight(1)、bias(1)、min/max(2) 后剩 28 个。每个像素需要 1 个累加器, 最多存 16 个 (v16~v31)。所以一次循环处理 16 个像素, 充分填充 NEON 流水线。</div>
+</div>
+<div class="qa">
+<div class="q">Group Convolution 的 Unpack/Repack 为什么必要？</div>
+<div class="a">subConvolution 要求在 NC4HW4 格式下独立运行, 但 full tensor 的 group 边界不一定在 pack=4 对齐位置。比如 ic=10, group=5, 每组 ic=2 但 pack=4 需要补齐。所以 Unpack→Slice→Repack 才能正确切分数据。</div>
+</div>
+
+<h2>深度总结</h2>
+<div class="checklist">
+<div class="checklist-item done">✅ Depthwise 专属 NEON: 不做 Im2Col, strided load 直接从源 tensor 读</div>
+<div class="checklist-item done">✅ 1 weight × 16 pixels 模式: 1×ld1 + 16×fmla, NEON 寄存器充分复用</div>
+<div class="checklist-item done">✅ Fast kernel: stride=1 时 12 连续 load + 滑动窗口, ~3× 加速</div>
+<div class="checklist-item done">✅ INT8 depthwise: sxtl→smlal→scvtf→fmul→sqxtn, SDOT 替代 5 条指令</div>
+<div class="checklist-item done">✅ Group Convolution: ConvolutionGroup 包裹 N 个 Execution, Unpack/Repack</div>
+<div class="checklist-item done">✅ 工厂决策: group=1 走 _createUnit, group>1 走 ConvolutionGroup</div>
+</div>
+
+<div class="footer">2026-06-08</div>
+</div>
+</body>
+</html>

@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>LLM 大模型 — MNN 学习</title><link rel="stylesheet" href="../../mnn.css"></head>
+<body>
+<div class="study-container">
+<div class="nav"><a href="../../mnn.html">← 返回总览</a><span>第四阶段 / LLM 大模型</span></div>
+<h1>LLM 大模型 — 端到端导出与推理</h1>
+<p class="status-tag">待学习</p>
+
+<h2>概览</h2>
+<p>MNN 支持完整的大模型导出（HuggingFace → MNN 格式）和推理（Prefill + Decode）。涵盖 Qwen / LLaMA / DeepSeek / Phi / Gemma 等主流模型系列。</p>
+
+<h2>核心主题</h2>
+
+<h3>1. 模型导出（Python）</h3>
+<table>
+<tr><th>文件</th><th>说明</th></tr>
+<tr><td><code>transformers/llm/export/llmexport.py</code></td><td>LLM 导出主入口：加载 HF 模型 → 转换 ONNX → 转 MNN</td></tr>
+<tr><td><code>transformers/llm/export/utils/model_mapper.py</code></td><td>模型字段映射（Qwen/LLaMA/DeepSeek/Phi/Gemma → 统一内部表示）</td></tr>
+<tr><td><code>transformers/llm/export/utils/model.py</code></td><td>统一的 LlmModel 类 + 各模型适配层</td></tr>
+<tr><td><code>transformers/llm/export/utils/transformers.py</code></td><td>Transformer 层导出：Attention / Decoder / RoPE / RMSNorm</td></tr>
+<tr><td><code>transformers/llm/export/utils/onnx.py</code></td><td>ONNX 构建 + 优化</td></tr>
+<tr><td><code>transformers/llm/export/utils/onnx_rebuilder.py</code></td><td>ONNX 图重构建（融合/替换/优化）</td></tr>
+<tr><td><code>transformers/llm/export/utils/tokenizer.py</code></td><td>Tokenizer 导出</td></tr>
+<tr><td><code>transformers/llm/export/utils/mnn_converter.py</code></td><td>ONNX → MNN 转换器</td></tr>
+<tr><td><code>transformers/llm/export/gguf2mnn.py</code></td><td>GGUF 格式 → MNN 转换</td></tr>
+<tr><td><code>transformers/llm/export/safetensors2mnn.py</code></td><td>safetensors 格式 → MNN 转换</td></tr>
+</table>
+
+<h3>2. 量化导出</h3>
+<table>
+<tr><th>文件</th><th>说明</th></tr>
+<tr><td><code>transformers/llm/export/utils/awq_quantizer.py</code></td><td>AWQ 量化（激活感知权重量化）</td></tr>
+<tr><td><code>transformers/llm/export/utils/gptq.py</code></td><td>GPTQ 量化（逐层 Hessian 优化量化）</td></tr>
+<tr><td><code>transformers/llm/export/utils/hqq_quantizer.py</code></td><td>HQQ 量化（Half-Quadratic Quantization）</td></tr>
+<tr><td><code>transformers/llm/export/utils/smooth_quantizer.py</code></td><td>SmoothQuant（激活平滑量化）</td></tr>
+<tr><td><code>transformers/llm/export/utils/omni_quantizer.py</code></td><td>Omni 量化（多模态统一量化）</td></tr>
+</table>
+
+<h3>3. 推理引擎（C++）</h3>
+<table>
+<tr><th>文件</th><th>说明</th></tr>
+<tr><td><code>transformers/llm/engine/src/llm.cpp</code></td><td><b>LLM 推理核心</b>：Prefill / Decode / Sample 主循环</td></tr>
+<tr><td><code>transformers/llm/engine/include/llm/llm.hpp</code></td><td>LLM 公开 API（Llm::create / run / response / token）</td></tr>
+<tr><td><code>transformers/llm/engine/src/omni.cpp</code></td><td>多模态推理（视觉 + 语言 + 音频）</td></tr>
+<tr><td><code>transformers/llm/engine/src/omni.hpp</code></td><td>Omni 模型接口</td></tr>
+<tr><td><code>transformers/llm/engine/src/sampler.cpp</code></td><td>采样策略：Top-K / Top-P / Temperature / Min-P</td></tr>
+<tr><td><code>transformers/llm/engine/src/sampler.hpp</code></td><td>Sampler 基类 + 采样策略注册</td></tr>
+<tr><td><code>transformers/llm/engine/src/tokenizer/tokenizer.cpp</code></td><td>Tokenizer（BPE/SentencePiece）</td></tr>
+<tr><td><code>transformers/llm/engine/src/embedding.cpp</code></td><td>Embedding 层</td></tr>
+<tr><td><code>transformers/llm/engine/src/diskembedding.cpp</code></td><td>磁盘 embedding（超大词表）</td></tr>
+<tr><td><code>transformers/llm/engine/src/kvmeta.hpp</code></td><td>KV Cache 元数据管理</td></tr>
+<tr><td><code>transformers/llm/engine/src/prompt_cache_utils.hpp</code></td><td>Prompt Cache（复用 prompt 的 KV Cache）</td></tr>
+<tr><td><code>transformers/llm/engine/src/llmconfig.cpp</code></td><td>LLM 配置加载（config.json 解析）</td></tr>
+</table>
+
+<h3>4. 推测解码（Speculative Decoding）</h3>
+<table>
+<tr><th>文件</th><th>说明</th></tr>
+<tr><td><code>transformers/llm/engine/src/speculative_decoding/generate.cpp</code></td><td>推测解码调度器</td></tr>
+<tr><td><code>transformers/llm/engine/src/speculative_decoding/eagle.cpp</code></td><td>EAGLE 推测解码（额外小模型预测草稿 token）</td></tr>
+<tr><td><code>transformers/llm/engine/src/speculative_decoding/lookahead.cpp</code></td><td>Lookahead 解码（MTP 多 token 预测）</td></tr>
+<tr><td><code>transformers/llm/engine/src/speculative_decoding/mtp.cpp</code></td><td>Multi-Token Prediction</td></tr>
+<tr><td><code>transformers/llm/engine/src/speculative_decoding/ngram.hpp</code></td><td>N-gram 匹配推测</td></tr>
+<tr><td><code>transformers/llm/engine/src/speculative_decoding/tokentree.hpp</code></td><td>Token 树搜索</td></tr>
+</table>
+
+<h3>5. Benchmark & 工具</h3>
+<table>
+<tr><th>文件</th><th>说明</th></tr>
+<tr><td><code>transformers/llm/engine/tools/llm_bench.cpp</code></td><td>LLM 性能基准测试（TTFT/TPOT/TPS）</td></tr>
+<tr><td><code>transformers/llm/engine/tools/quantize_llm.cpp</code></td><td>LLM 量化工具（离线量化）</td></tr>
+<tr><td><code>transformers/llm/engine/tools/ppl_eval.cpp</code></td><td>困惑度评估</td></tr>
+<tr><td><code>transformers/llm/engine/app/llm_benchmark.cpp</code></td><td>LLM Benchmark App</td></tr>
+<tr><td><code>transformers/llm/engine/app/mls_server.cpp</code></td><td>LLM HTTP Server（OpenAI 兼容 API）</td></tr>
+</table>
+
+<h2>LLM 推理 Pipeline</h2>
+<pre>用户输入 "Hello, how"
+  │
+  ▼
+┌─ Tokenizer ──────────────────────────────────────────┐
+│  编码 → token ids: [15496, 11, 423, ...]             │
+└──────────────────────────────────────────────────────┘
+  │
+  ▼
+┌─ Prefill (并行) ─────────────────────────────────────┐
+│  Prompt 所有 token 并行过 Transformer                 │
+│  建立 KV Cache: 每个 Decoder Layer 存储 K/V           │
+│  输出: 最后一个 token 的 logits                       │
+└──────────────────────────────────────────────────────┘
+  │
+  ▼
+┌─ Sample ─────────────────────────────────────────────┐
+│  Top-K / Top-P / Temperature 采样                     │
+│  选出下一个 token: "are"                              │
+└──────────────────────────────────────────────────────┘
+  │
+  ▼
+┌─ Decode (串行, 逐 token) ────────────────────────────┐
+│  每次只算新 token 的 QKV                               │
+│  Attention: concat(历史 K/V, 新 K/V)                   │
+│  利用 KV Cache 避免重算 → 大幅减少 Prefill 之外的 FLOPs│
+│  重复直到 <EOS> 或 max_len                             │
+└──────────────────────────────────────────────────────┘
+  │
+  ▼
+输出: "Hello, how are you?"</pre>
+
+<h2>面试重点</h2>
+<div class="qa">
+<div class="q">Prefill 和 Decode 的本质区别？</div>
+<div class="a">Prefill：并行处理 prompt token，计算密集（compute-bound），利用 GEMM 批量优势。Decode：逐 token 串行，内存密集（memory-bound），瓶颈在逐层加载权重。</div>
+</div>
+<div class="qa">
+<div class="q">KV Cache 为什么重要？</div>
+<div class="a">自回归推理每个新 token 的 attention 都需要所有历史 token 的 K/V。不缓存则每个 decode 步都重算全部 history，总复杂度从 O(n²) 暴增到 O(n³)。</div>
+</div>
+<div class="qa">
+<div class="q">INT4 量化如何实现？</div>
+<div class="a">权重量化为 4-bit（16 个值），推理时做 dequant 恢复成 FP16/BF16 再计算。MNN 支持 AWQ/HQQ/GPTQ 等方案，核心是找到最优 scale/zero 使得量化误差最小。</div>
+</div>
+<div class="qa">
+<div class="q">推测解码加速原理？</div>
+<div class="a">小模型快速生成 K 个候选 token → 大模型并行验证 → 接受正确的 → 拒绝错的从第一个错误处重新生成。一次验证多 token，突破自回归的串行瓶颈。</div>
+</div>
+
+<h2>学习路径建议</h2>
+<ol>
+  <li>LLM 导出流程：llmexport.py → model_mapper.py → transformers.py → ONNX → MNN Converter</li>
+  <li>推理引擎：llm.cpp 的 Prefill / Decode 主循环</li>
+  <li>KV Cache：KVCache 内存分配 + Past K/V 拼接</li>
+  <li>采样器：Top-K / Top-P / Temperature 实现</li>
+  <li>量化：AWQ / HQQ / GPTQ 原理 + 导出</li>
+  <li>推测解码：EAGLE / Lookahead 调度机制</li>
+  <li>Benchmark：TTFT / TPOT / TPS 性能指标</li>
+</ol>
+
+<div class="footer">2026-06-05</div>
+</div>
+</body>
+</html>

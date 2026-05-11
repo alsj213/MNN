@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Diffusion — MNN 学习</title><link rel="stylesheet" href="../../mnn.css"></head>
+<body>
+<div class="study-container">
+<div class="nav"><a href="../../mnn.html">← 返回总览</a><span>第五阶段 / Diffusion</span></div>
+<h1>Diffusion — 扩散模型推理</h1>
+<p class="status-tag">待学习</p>
+
+<h2>概览</h2>
+<p>MNN 支持 Stable Diffusion 1.5 / 2.1 / XL / SD3.5 和 SANA 等扩散模型推理。扩散模型通过迭代去噪生成图像，每个 denoising step 包含 UNet / Text Encoder / VAE 三个子模型。</p>
+
+<h2>核心主题</h2>
+
+<h3>1. 推理引擎</h3>
+<table>
+<tr><th>文件</th><th>说明</th></tr>
+<tr><td><code>transformers/diffusion/engine/src/stable_diffusion.cpp</code></td><td>Stable Diffusion 推理主逻辑 (文生图 / 图生图)</td></tr>
+<tr><td><code>transformers/diffusion/engine/include/diffusion/stable_diffusion.hpp</code></td><td>StableDiffusion 公开 API</td></tr>
+<tr><td><code>transformers/diffusion/engine/src/diffusion_sd35.cpp</code></td><td>SD3.5 支持（MMDiT 架构）</td></tr>
+<tr><td><code>transformers/diffusion/engine/include/diffusion/diffusion_sd35.hpp</code></td><td>SD3.5 接口</td></tr>
+<tr><td><code>transformers/diffusion/engine/src/sana_diffusion.cpp</code></td><td>SANA 扩散模型（高效 DiT 变体）</td></tr>
+<tr><td><code>transformers/diffusion/engine/include/diffusion/sana_diffusion.hpp</code></td><td>SANA 接口</td></tr>
+<tr><td><code>transformers/diffusion/engine/include/diffusion/sana_llm.hpp</code></td><td>SANA 中的 LLM 组件</td></tr>
+<tr><td><code>transformers/diffusion/engine/src/diffusion.cpp</code></td><td>Diffusion 基类</td></tr>
+</table>
+
+<h3>2. 调度器（Scheduler）</h3>
+<table>
+<tr><th>文件</th><th>说明</th></tr>
+<tr><td><code>transformers/diffusion/engine/src/scheduler.cpp</code></td><td>调度器：DDPM / DDIM / Euler Ancestral 采样器</td></tr>
+<tr><td><code>transformers/diffusion/engine/src/scheduler.hpp</code></td><td>Scheduler 类定义</td></tr>
+</table>
+
+<h3>3. 模型导出</h3>
+<table>
+<tr><th>文件</th><th>说明</th></tr>
+<tr><td><code>transformers/diffusion/export/convert_mnn.py</code></td><td>Stable Diffusion 导出脚本 (Text Encoder + UNet + VAE)</td></tr>
+<tr><td><code>transformers/diffusion/export/convert_mnn_sd35.py</code></td><td>SD3.5 导出</td></tr>
+<tr><td><code>transformers/diffusion/export/sana_convert_mnn.py</code></td><td>SANA 导出</td></tr>
+<tr><td><code>transformers/diffusion/export/onnx_export.py</code></td><td>ONNX 导出中间步骤</td></tr>
+</table>
+
+<h3>4. Demo</h3>
+<table>
+<tr><th>文件</th><th>说明</th></tr>
+<tr><td><code>transformers/diffusion/engine/diffusion_demo.cpp</code></td><td>Stable Diffusion 示例</td></tr>
+<tr><td><code>transformers/diffusion/engine/diffusion_sd35_demo.cpp</code></td><td>SD3.5 示例</td></tr>
+<tr><td><code>transformers/diffusion/engine/sana_diffusion_demo.cpp</code></td><td>SANA 示例</td></tr>
+</table>
+
+<h3>5. Tokenizer</h3>
+<table>
+<tr><th>文件</th><th>说明</th></tr>
+<tr><td><code>transformers/diffusion/engine/src/tokenizer.cpp</code></td><td>CLIP Tokenizer（文本编码）</td></tr>
+<tr><td><code>transformers/diffusion/engine/src/tokenizer.hpp</code></td><td>Tokenizer 接口</td></tr>
+</table>
+
+<h2>Diffusion 推理 Pipeline</h2>
+<pre>prompt = "a cat sitting on a couch"
+
+┌─ Text Encoder (只跑一次) ──────────────────┐
+│  CLIP Tokenizer → Text Encoder → embedding │
+│  输出: 文本条件向量 [1, 77, 768]             │
+└────────────────────────────────────────────┘
+  │
+  ▼
+┌─ Denoising Loop (迭代 N 步) ───────────────┐
+│  for t in timesteps (1000→0, 通常 20~50 步):│
+│    1. 随机噪声 + 当前 latent + t + text_emb │
+│    2. UNet 预测噪声                         │
+│    3. Scheduler 更新 latent (去噪一步)        │
+│  → 输出: 去噪后的 latent [1, 4, H/8, W/8]   │
+└────────────────────────────────────────────┘
+  │
+  ▼
+┌─ VAE Decoder (只跑一次) ────────────────────┐
+│  latent [1,4,64,64] → VAE Decode            │
+│  → 图像 [3, 512, 512]                       │
+└────────────────────────────────────────────┘</pre>
+
+<h2>面试重点</h2>
+<div class="qa">
+<div class="q">扩散模型推理的瓶颈在哪？</div>
+<div class="a">UNet 的多次迭代（20-50 步）是主要瓶颈。每步都需要完整跑一次 UNet 前向，总推理时间 ≈ 单步 UNet 时间 × 步数。优化方向：减少步数（DDIM 采样）、UNet 量化/剪枝、Batch 调度。</div>
+</div>
+<div class="qa">
+<div class="q">UNet 的结构特点？</div>
+<div class="a">Encoder-Decoder 对称结构 + Skip Connection。下采样提取特征 → Bottleneck → 上采样恢复分辨率。每个 block 包含 ResBlock + Attention + Time Embedding。和分类 CNN 的 UNet 不同，Diffusion UNet 输入条件包括 timestep 和 text embedding。</div>
+</div>
+<div class="qa">
+<div class="q">VAE 在 Diffusion 中的作用？</div>
+<div class="a">编码器 (Encoder) 将图像压缩到 latent space（8× 下采样），解码器 (Decoder) 将 latent 恢复为图像。Diffusion 过程在 latent space 进行（而非像素空间），大幅减少计算量。Latent 通常 4 通道，而原图 3 通道。</div>
+</div>
+<div class="qa">
+<div class="q">Scheduler 的作用？</div>
+<div class="a">控制去噪过程的步长和噪声调度。DDPM 按固定 β 序列加噪/去噪；DDIM 允许跳步加速（从 1000 步减少到 20-50 步）；Euler Ancestral 引入随机性增加多样性。Scheduler 决定"每一步去多少噪声"。</div>
+</div>
+
+<h2>学习路径建议</h2>
+<ol>
+  <li>Diffusion 数学原理：前向加噪 → 反向去噪 (DDPM / DDIM)</li>
+  <li>导出流程：convert_mnn.py 如何拆分 Text Encoder / UNet / VAE</li>
+  <li>UNet 推理：ResBlock + SpatialTransformer + CrossAttention</li>
+  <li>Scheduler：DDIM / Euler 采样步长与去噪更新公式</li>
+  <li>VAE Decoder：latent → 像素图像的完整数据流</li>
+  <li>SD3.5 / SANA：MMDiT / DiT 新架构对比</li>
+</ol>
+
+<div class="footer">2026-06-05</div>
+</div>
+</body>
+</html>

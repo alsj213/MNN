@@ -1,0 +1,586 @@
+<!doctype html>
+<html lang="zh-CN">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width,initial-scale=1.0" />
+        <title>模型加载 — MNN 学习</title>
+        <link rel="stylesheet" href="../../../mnn.css" />
+    </head>
+    <body>
+        <div class="study-container">
+            <div class="nav">
+                <a href="../../../mnn.html">← 返回总览</a
+                ><span>01 / 模型加载</span>
+            </div>
+            <h1>模型加载 — MNN.fbs 各 table 分析</h1>
+            <p class="status-tag done">已完成</p>
+
+            <h2>核心数据结构总览</h2>
+            <pre>
+Net（模型根）
+├── bizCode             业务标识
+├── oplists: [Op]       算子列表 ← 核心！
+├── tensorName          所有 tensor 名称
+├── tensorNumber        tensor 总数
+├── outputName          输出名称
+├── sourceType          来源框架 (CAFFE/TF/ONNX/TORCH)
+├── extraTensorDescribe 额外 tensor 描述
+├── subgraphs           子图列表
+├── preferForwardType   首选后端
+├── usage               INFERENCE/TRAIN/INFERENCE_STATIC
+└── mnn_uuid            模型唯一 ID</pre
+            >
+
+            <!-- ===== FileLoader merge ===== -->
+            <div
+                style="
+                    background: #fff8e1;
+                    border-radius: 8px;
+                    padding: 16px 20px;
+                    margin: 12px 0;
+                    border-left: 4px solid #f9a825;
+                "
+            >
+                <h3 style="font-size: 15px; margin-bottom: 8px">
+                    模型加载关键细节：FileLoader + merge
+                </h3>
+                <pre style="font-size: 13px; margin: 0">
+FileLoader::read()                     FileLoader::merge(buffer)
+        │                                      │
+        │ 每次读 4KB                             │ buffer.reset(totalSize)
+        ▼                                      ▼
+  mBlocks (分散)                         buffer (连续)
+  ┌──────┐                               ┌──────────────────┐
+  │ 4KB  │                               │                  │
+  ├──────┤   memcpy 逐块合并              │  完整 .mnn 文件   │
+  │ 4KB  │ ──────────────────────→       │                  │
+  ├──────┤                               │  传给 GetNet()   │
+  │ 512B │                               │  零拷贝反序列化    │
+  └──────┘                               └──────────────────┘</pre
+                >
+                <p style="font-size: 13px; margin: 8px 0 0">
+                    <b>为什么要 merge？</b>FlatBuffers 的
+                    <code>GetNet(buffer)</code> 要求 buffer
+                    是<u>一整块连续内存</u>，它通过计算偏移量来访问各个字段。如果内存是分散的就没法直接算偏移。merge
+                    就是把散块拼成一块连续区域。
+                </p>
+            </div>
+
+            <!-- ===== Op ===== -->
+            <h2>1. Op — 算子</h2>
+            <pre>
+table Op {
+    inputIndexes: [int];        // 输入 tensor 索引列表
+    outputIndexes: [int];       // 输出 tensor 索引列表
+    name: string;               // 算子名称
+    type: OpType;               // 算子类型（枚举，200+ 种）
+    main: OpParameter;          // 算子参数（union）
+    defaultDimentionFormat: MNN_DATA_FORMAT;  // 默认数据格式
+    externalPath: string;       // 外部权重文件路径（大模型用）
+}</pre
+            >
+            <p>
+                <b>设计意图：</b>Op 是计算图的基本节点。tensor 不内嵌而是用 int
+                索引引用，使得多个 Op 可以共享同一个
+                tensor，也方便图遍历和内存复用分析。<code>main</code> 字段用
+                union 使得不同 Op 有不同类型安全和紧凑的参数。<code
+                    >externalPath</code
+                >
+                支持 LLM 中将权重文件分离，减少模型加载内存。
+            </p>
+
+            <!-- ===== OpParameter ===== -->
+            <h2>2. OpParameter — 算子参数 union</h2>
+            <pre>
+union OpParameter {
+    Convolution2D,    // 卷积参数（filter, kernel, stride, pad, dilate...）
+    MatMul,           // 矩阵乘参数（transposeA, transposeB）
+    Pool,             // 池化参数
+    BatchNorm,        // BN 参数
+    Scale,            // Scale 参数
+    Reshape,          // Reshape 参数
+    Slice,            // Slice 参数
+    Extra,            // 自定义算子参数（opaque bytes）
+    LayerNorm,        // LayerNorm 参数
+    AttentionParam,   // Attention 参数
+    LoopParam,        // 循环参数
+    // ... 共 60+ 种
+}</pre
+            >
+            <p>
+                <b>设计意图：</b>union 是 FlatBuffers 的 tagged union，每个
+                OpType 精确对应一个参数类型。Conv2D
+                有十几字段（kernel_size、stride、pad、dilate、group 等），而
+                ReLU 不需任何参数。使用 union 相比每个 Op
+                一个独立字段更紧凑、类型安全。新增 OpType 只需添加新的 union
+                成员，不破坏已有代码。
+            </p>
+
+            <!-- ===== Convolution2D ===== -->
+            <h2>3. 典型参数表：Convolution2D</h2>
+            <pre>
+// 来自 CaffeOp.fbs
+table Convolution2D {
+    common: Convolution2DCommon;
+    weight: [float];      // 权重数据
+    bias: [float];        // 偏置数据
+    weightSize: int;
+    biasSize: int;
+}
+table Convolution2DCommon {
+    kernelX: int;     kernelY: int;
+    strideX: int;     strideY: int;
+    padX: int;        padY: int;
+    dilateX: int;     dilateY: int;
+    outputCount: int;
+    group: int;
+    relu: bool;       // 是否 fused ReLU
+    relu6: bool;      // 是否 fused ReLU6
+}</pre
+            >
+            <p>
+                <b>设计意图：</b>Conv+BN+ReLU 在转换期会被融合成一个
+                ConvOp，所以 Conv2DCommon 里直接带 relu/relu6 标志位。<code
+                    >group</code
+                >
+                字段支持 depthwise/group convolution。<code>common</code>
+                独立成一个嵌套 table 使得可以复用（如 Conv2D 和 Conv3D
+                可以共享部分结构）。
+            </p>
+
+            <!-- ===== Blob ===== -->
+            <h2>4. Blob — 数据容器（来自 Tensor.fbs）</h2>
+            <pre>
+table Blob {
+    dims: [int];            // 形状 [N, C, H, W]
+    dataFormat: MNN_DATA_FORMAT;  // NCHW / NHWC / NC4HW4
+    dataType: DataType;         // DT_FLOAT / DT_INT8 / ...
+    float32s: [float];      // float 权重
+    int8s: [byte];          // int8 量化权重
+    uint8s: [ubyte];        // uint8 量化权重
+    int32s: [int];          // int32 权重（如 int4 打包）
+    int64s: [long];         // int64 数据
+    strings: [string];      // 字符串数据
+    external: [int64];      // [offset, size] 外部文件引用
+}</pre
+            >
+            <p>
+                <b>设计意图：</b>Blob
+                的设计体现了推理引擎的核心需求：<b>支持多种量化格式的权重存储</b>。float32s/int8s/uint8s
+                覆盖了主流量化类型；external
+                字段允许大模型权重不加载进模型文件，而是通过 mmap
+                按需加载。dataFormat
+                字段使得模型可以记录自己的布局格式，运行时按需转换。
+            </p>
+
+            <!-- ===== Net ===== -->
+            <h2>5. Net — 模型根</h2>
+            <pre>
+table Net {
+    bizCode: string;                // 业务标识
+    extraTensorDescribe: [TensorDescribe];
+    extraInfo: ExtraInfo;
+    oplists: [Op];                  // ← 核心：算子列表
+    outputName: [string];           // 输出 tensor 名称
+    preferForwardType: ForwardType; // 首选推理后端
+    sourceType: NetSource;          // 来源框架
+    tensorName: [string];           // 所有 tensor 名称
+    tensorNumber: int;              // tensor 总数
+    usage: Usage;                   // INFERENCE / TRAIN
+    subgraphs: [SubGraphProto];     // 子图
+    mnn_uuid: string;               // 模型唯一 ID
+}</pre
+            >
+            <p>
+                <b>设计意图：</b>Net 是所有数据的根节点。<code>oplists</code>
+                是核心，按拓扑序排列。<code>tensorName</code> 和
+                <code>tensorNumber</code> 把 tensor 元数据集中管理，与 Op
+                解耦。<code>subgraphs</code> 支持 LLM 的子图复用。<code
+                    >mnn_uuid</code
+                >
+                用于模型版本追踪和缓存验证。
+            </p>
+            <p>
+                <b>对比 ONNX：</b>ONNX 的 ModelProto 有
+                ir_version、opset_import、graph、metadata_props 等字段，而 MNN
+                更精简，只保留推理必需的信息，没有训练相关的版本号、算子集声明等。
+            </p>
+
+            <!-- ===== SubGraphProto ===== -->
+            <h2>6. SubGraphProto — 子图</h2>
+            <pre>
+table SubGraphProto {
+    name: string;           // 子图唯一名称
+    inputs: [int];          // 输入 tensor id
+    outputs: [int];         // 输出 tensor id
+    tensors: [string];      // 子图内 tensor 名称
+    nodes: [Op];            // 子图内 Op 列表
+    extraTensorDescribe: [TensorDescribe];
+}</pre
+            >
+            <p><b>设计意图：</b>子图让 MNN 支持控制流和模型并行：</p>
+            <ul>
+                <li>
+                    <b>LLM 多层复用：</b>multi-layer 模型可以共享同一套子图参数
+                </li>
+                <li><b>MoE（混合专家）：</b>每个 expert 作为一个子图</li>
+                <li>
+                    <b>控制流：</b>If/While 算子的条件体和循环体各为一个子图
+                </li>
+                <li>子图有独立的 tensor 命名空间，与主图隔离</li>
+            </ul>
+
+            <!-- ===== TensorDescribe ===== -->
+            <h2>7. TensorDescribe — Tensor 描述</h2>
+            <pre>
+table TensorDescribe {
+    blob: Blob;           // tensor 的形状和数据
+    index: int;           // tensor 索引
+    name: string;         // tensor 名称
+    regions: [Region];    // 内存区域描述（Raster 操作）
+    quantInfo: TensorQuantInfo;  // 量化信息
+}
+table TensorQuantInfo {
+    scale: float;      // 量化 scale
+    zero: float = 0;   // 量化 zero_point
+    min: float = -128; // 量化范围 min
+    max: float = 127;  // 量化范围 max
+    type: DataType;    // 量化数据类型
+}</pre
+            >
+            <p>
+                <b>设计意图：</b>TensorDescribe 是 tensor 的元数据描述，与实际的
+                tensor 数据分离。<code>regions</code> 用于描述 tensor
+                的内存布局（Raster 操作时描述如何从输入拼接到输出），是 MNN
+                geometry 计算的关键。<code>quantInfo</code>
+                记录了量化参数，使得推理时可以直接反量化。
+            </p>
+
+            <!-- ===== Region / View ===== -->
+            <h2>8. Region &amp; View — 内存区域</h2>
+            <pre>
+table View {
+    offset: int;         // 字节偏移
+    stride: [int];       // 步长
+}
+table Region {
+    src: View;           // 源区域
+    dst: View;           // 目标区域
+    size: [int];         // 区域大小
+    origin: int;         // 源 tensor 索引
+}</pre
+            >
+            <p>
+                <b>设计意图：</b>Region 描述了一个
+                <b>tensor 到另一个 tensor 的内存拷贝/拼接操作</b>。src 和 dst
+                各是一个 View，描述偏移和步长。这样 Concat、Slice、Pad
+                等操作可以统一表达为 Region 操作，无需每个 op
+                单独实现内存拷贝。这是 MNN <b>Raster 架构</b>的核心：用 Region
+                统一表达所有非计算型 Op。
+            </p>
+
+            <!-- ===== LoopParam / RegionCommand ===== -->
+            <h2>9. LoopParam &amp; RegionCommand — 循环</h2>
+            <pre>
+table LoopParam {
+    tensorNumber: int;         // 循环内 tensor 数量
+    outputIndexes: [int];     // 输出 tensor 索引
+    inputIndexes: [int];      // 输入 tensor 索引
+    loopNumber: int;          // 循环次数
+    parallel: bool = true;    // 是否可并行
+    commands: [RegionCommand];// 循环体指令
+    initCommand: [RegionCommand]; // 输出初始化指令
+}
+table RegionCommand {
+    op: Op;                  // 循环体内的 Op
+    steps: [int];            // 步长
+    size: [int];             // 大小
+    indexes: [int];          // 索引
+    view: [View];            // 视图
+    fuse: int = -1;          // 融合模式
+    iterIndexes: [int];      // 迭代索引
+}</pre
+            >
+            <p>
+                <b>设计意图：</b>LoopParam 将循环语义引入计算图。loopNumber
+                控制迭代次数，commands 定义循环体。<code>parallel = true</code>
+                表示循环可以并行执行（如逐元素操作）。<code>iterIndexes</code>
+                支持非连续索引迭代。<code>fuse</code>
+                字段用负值表示覆盖模式，非负值表示融合的二元操作（如累加）。这是
+                RNN 和部分循环操作的基础。
+            </p>
+
+            <!-- ===== Extra ===== -->
+            <h2>10. Extra — 自定义算子</h2>
+            <pre>
+table Extra {
+    type: string;           // 自定义算子类型名
+    engine: string;         // 引擎名称
+    info: [byte];           // 不透明参数（opaque bytes）
+    attr: [Attribute];      // 属性列表（key-value）
+    vector: bool;           // 是否可向量化执行
+}</pre
+            >
+            <p>
+                <b>设计意图：</b>Extra 是 MNN
+                的"逃生口"——遇到不支持的算子时，可以将其序列化为不透明字节保存。运行时由对应的
+                Plugin/engine 加载执行。<code>vector</code>
+                表示该算子是否可以批量执行（如逐元素操作可以用 SIMD
+                向量化）。这让 MNN 可以支持
+                <b>Plugin 扩展</b>而不需要修改核心代码。
+            </p>
+
+            <!-- ===== WhileParam / IfParam ===== -->
+            <h2>11. WhileParam &amp; IfParam — 控制流</h2>
+            <pre>
+table WhileParam {
+    cond_graph: string;         // 条件子图名称
+    body_graph: string;         // 循环体子图名称
+    aliases_inputs: [StringVec];  // 输入别名映射
+    aliases_outputs: [string];    // 输出别名映射
+    aliases_updates: [StringVec]; // 更新别名映射
+}
+table IfParam {
+    then_graph: string;         // then 分支子图
+    else_graph: string;         // else 分支子图
+    aliases_inputs: [StringVec];
+    aliases_outputs: [StringVec];
+}</pre
+            >
+            <p>
+                <b>设计意图：</b>这两个 table 让 MNN
+                支持条件分支和循环控制流。<code>aliases_inputs/outputs</code>
+                解决子图与主图的 tensor
+                命名空间映射问题。一个主图的输入可能对应多个子图的输入（由
+                StringVec 表示），因此用 <code>[StringVec]</code> 而非
+                <code>[string]</code>。
+            </p>
+
+            <!-- ===== 关键枚举 ===== -->
+            <h2>12. 关键枚举</h2>
+
+            <h3>OpType（200+ 种算子）</h3>
+            <pre>
+enum OpType : int {
+    // 基础算子 (0-150)
+    Convolution, Pooling, ReLU, Softmax, Concat,
+    MatMul, BatchMatMul, Reshape, Transpose, Slice,
+    // CNN 相关
+    ConvolutionDepthwise, Deconvolution, ROIAlign,
+    // 循环/控制流
+    RNN, LSTM, While, If,
+    // Transformer/NLP
+    Attention = 299, FmhaV2 = 300, LayerNorm = 603,
+    // LLM 相关
+    MoE = 58, Raster = 128, Extra = 512,
+    // 量化相关
+    ConvInt8 = 513, DepthwiseConvInt8 = 515,
+    // ...
+}</pre
+            >
+            <p>
+                <b>意图：</b>OpType
+                枚举涵盖了主流深度学习模型需要的所有算子类型。<code
+                    >Raster = 128</code
+                >
+                是个特殊算子——它不执行任何数学计算，只做内存区域操作，由 Region
+                描述。值 512+ 留给自定义算子，256+ 留给训练算子。
+            </p>
+
+            <h3>MNN_DATA_FORMAT</h3>
+            <pre>
+enum MNN_DATA_FORMAT : byte {
+    NCHW = 0,  // 标准格式
+    NHWC,      // TensorFlow 格式
+    NC4HW4,    // MNN 内部 SIMD 优化格式
+    NHWC4,     // 类似 TensorFlow 的 NHWC + channels-aligned
+    UNKNOWN
+}</pre
+            >
+            <p>
+                <b>意图：</b>NC4HW4 是 MNN 性能优化的核心——channels 按 4
+                打包以便利用 ARM NEON / x86 SSE 的 128 位寄存器。NHWC4 是
+                TensorFlow 风格的 channel-last +
+                对齐。模型加载后运行时会根据后端自动选择最优布局。
+            </p>
+
+            <h3>NetSource</h3>
+            <pre>
+enum NetSource : byte {
+    CAFFE, TENSORFLOW, TFLITE, ONNX, TORCH
+}</pre
+            >
+            <p>
+                <b>意图：</b
+                >标记模型的来源框架。不同来源的网络可能有不同的算子命名和参数习惯，这个标记帮助转换期做针对性的图优化。
+            </p>
+
+            <!-- ===== 各 table 关系图 ===== -->
+            <h2>各 table 关系</h2>
+            <pre>
+Net ──┬── oplists: [Op] ──────────── main: OpParameter (union)
+      │                                  ├── Convolution2D ── Convolution2DCommon
+      │                                  ├── MatMul
+      │                                  ├── Extra (自定义)
+      │                                  ├── AttentionParam
+      │                                  ├── LoopParam ── [RegionCommand] ── Op
+      │                                  └── ... (60+ 种)
+      │
+      ├── tensorName: [string]
+      ├── subgraphs: [SubGraphProto] ── nodes: [Op]
+      │
+      └── extraTensorDescribe: [TensorDescribe]
+              ├── blob: Blob ── float32s/int8s/uint8s/external
+              ├── regions: [Region] ── src: View, dst: View
+              └── quantInfo: TensorQuantInfo ── scale/zero/min/max/type</pre
+            >
+
+            <!-- ===== Tensor 索引 ===== -->
+            <h2>Tensor 存在哪里？Op 如何索引？</h2>
+
+            <h3>.mnn 文件中</h3>
+            <p>
+                权重 tensor 存在 <code>Const</code> 类型 Op 的
+                <code>Blob</code> 中。激活 tensor 不在文件中，运行时才创建。
+            </p>
+            <pre>
+.mnn 文件:
+Net
+├── tensorName: ["data", "conv/w", "conv/o", ...]
+└── oplists:
+    ├── Op[0]: type=Const, outputIndexes=[1]
+    │   └── main: Blob { float32s: [0.1, 0.2...] }
+    ├── Op[1]: type=Convolution, inputIndexes=[0,1], outputIndexes=[2]
+    └── ...</pre
+            >
+
+            <h3>运行时（Schedule 创建 Session）</h3>
+            <pre>
+source/utils/InitNet.cpp
+
+// 1. 按 tensor 总数分配数组
+tensors.resize(net->tensorName()->size());
+//   allTensors[0] ~ allTensors[N-1]
+
+// 2. 遍历 Op，Const 类型加载权重
+for each op in oplists:
+  if op.type == Const:
+    index = op->outputIndexes()[0]   // 取出 tensor ID
+    tensors[index].reset(new Tensor)  // 创建 Tensor
+    loadBlobData(op->main, tensor)    // 从 Blob 复制权重
+
+// 3. 遍历 Op，创建输入输出 Tensor
+for each op in oplists:
+  for v in op->inputIndexes():
+    _createTensor(tensors[v], v)      // 创建输入 Tensor
+  for v in op->outputIndexes():
+    _createTensor(tensors[v], v)      // 创建输出 Tensor</pre
+            >
+
+            <h3>索引机制图解</h3>
+            <pre>
+.mnn 文件                          运行时内存
+─────────────────                 ──────────────
+tensorName[0]="data"              allTensors[0] → Tensor*
+tensorName[1]="conv/w"            allTensors[1] → Tensor* 权重
+tensorName[2]="conv/o"            allTensors[2] → Tensor*
+tensorName[3]="relu/o"            allTensors[3] → Tensor*
+
+Op: Conv, inputIndexes=[0,1]  →  allTensors[0], allTensors[1]
+          outputIndexes=[2]   →  allTensors[2]
+Op: ReLU, inputIndexes=[2]    →  allTensors[2]  ← 共享！
+          outputIndexes=[3]   →  allTensors[3]</pre
+            >
+
+            <h3>关键文件</h3>
+            <ul>
+                <li>
+                    <code>source/utils/InitNet.cpp:46</code> — tensors.resize()
+                </li>
+                <li>
+                    <code>source/utils/InitNet.cpp:50-94</code> — Const Op
+                    权重加载
+                </li>
+                <li>
+                    <code>source/utils/InitNet.cpp:126-137</code> —
+                    inputIndexes/outputIndexes 遍历
+                </li>
+                <li>
+                    <code>source/core/Schedule.cpp:309</code> — allTensors
+                    传调度
+                </li>
+            </ul>
+
+            <!-- ===== 面试问答 ===== -->
+            <h2>面试问答</h2>
+
+            <div class="qa">
+                <div class="q">
+                    Q: 为什么 MNN 的 Net 比 ONNX 的 ModelProto 精简那么多？
+                </div>
+                <div class="a">
+                    MNN 是推理引擎，只需要前向计算所需的信息。ONNX
+                    需要保存计算图定义（ir_version、opset_import、producer_name
+                    等），MNN 不需要这些。<code>mnn_uuid</code> 是 MNN
+                    唯一保留的元数据，用于缓存验证。
+                </div>
+            </div>
+
+            <div class="qa">
+                <div class="q">Q: Blob 的 external 字段有什么作用？</div>
+                <div class="a">
+                    LLM 模型的权重可能几十
+                    GB，全部加载到模型文件不现实。external: [int64] 存储
+                    [offset, size]，指向外部权重文件，运行时用 mmap
+                    按需加载。这是 MNN 低内存模式的关键设计。
+                </div>
+            </div>
+
+            <div class="qa">
+                <div class="q">Q: Region/View 设计解决了什么问题？</div>
+                <div class="a">
+                    Concat、Slice、Pad、Split 这些 Op 本质上都是"把一片数据从 A
+                    复制到 B"。MNN 用 Region + View 统一描述所有这类操作，运行时
+                    Raster Op
+                    统一执行。好处：<b>减少算子种类、统一优化内存拷贝、方便图融合</b>。"
+                </div>
+            </div>
+
+            <div class="qa">
+                <div class="q">Q: 如何给 MNN 添加一个全新算子？</div>
+                <div class="a">
+                    <b>四步走：</b>1. MNN.fbs 的 OpType 枚举加新类型 → 2.
+                    OpParameter union 加新参数 table → 3. 实现 Shape 推导
+                    (source/shape/) → 4. 实现 Geometry 计算 (source/geometry/) →
+                    5. 实现 Backend 执行 (source/backend/cpu/)。这就是
+                    <b>Schema → Shape → Geometry → Execution</b> 的 Op
+                    注册模式。
+                </div>
+            </div>
+
+            <div class="qa">
+                <div class="q">Q: MNN.fbs 为什么没有版本号字段？</div>
+                <div class="a">
+                    FlatBuffers 天生支持 schema
+                    演进：新增字段有默认值，旧文件读取自动填充。不需要显式的版本号。MNN
+                    通过 <code>mnn_uuid</code> 做模型唯一标识，运行时检测 schema
+                    不兼容的情况。
+                </div>
+            </div>
+
+            <div class="qa">
+                <div class="q">
+                    Q: 为什么 OpType 里 Raster=128、ConvInt8=513 这些值有跳空？
+                </div>
+                <div class="a">
+                    分段设计：0-150 是基础算子、128 固定给 Raster、256 预留
+                    Plugin、257+ 训练算子、299+ Transformer 优化算子、512+
+                    量化算子、600+
+                    控制流/新算子。跳空是为了<b>给不同类别的算子预留扩展空间</b>，避免插入新算子时重新编号。
+                </div>
+            </div>
+
+            <div class="footer">2026-05-15</div>
+        </div>
+    </body>
+</html>

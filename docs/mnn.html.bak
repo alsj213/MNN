@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MNN 源码学习 — 导航总览</title>
+<style>
+  :root { --bg: #f8f9fa; --card: #fff; --border: #dee2e6; --text: #212529; --muted: #6c757d; --blue: #4361ee; --green: #2d6a4f; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; padding: 24px; }
+  .container { max-width: 1100px; margin: 0 auto; }
+  a { color: var(--blue); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  .header { background: linear-gradient(135deg, #4361ee, #7c3aed); color: white; border-radius: 16px; padding: 36px 40px; margin-bottom: 28px; }
+  .header h1 { font-size: 28px; margin-bottom: 6px; }
+  .header p { opacity: .85; font-size: 14px; }
+  .header .badges { display: flex; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
+  .header .badges span { background: rgba(255,255,255,.2); padding: 4px 14px; border-radius: 20px; font-size: 12px; font-weight: 600; }
+
+  h2 { font-size: 18px; margin: 24px 0 14px; }
+  .diagram-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 14px; margin-bottom: 24px; }
+  .diagram-card { background: var(--card); border-radius: 12px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .diagram-card .preview { height: 120px; background: #f1f3f5; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+  .diagram-card .preview img { width: 100%; height: 100%; object-fit: cover; }
+  .diagram-card .info { padding: 12px 16px; }
+  .diagram-card .info .name { font-size: 14px; font-weight: 600; }
+  .diagram-card .info .desc { font-size: 12px; color: var(--muted); }
+
+  .tree { font-family: monospace; font-size: 13px; line-height: 2; background: #1e1e2e; color: #cdd6f4; border-radius: 12px; padding: 20px 24px; overflow-x: auto; margin-bottom: 24px; }
+  .tree .folder { color: #89b4fa; } .tree .file { color: #a6e3a1; } .tree .new { color: #f9e2af; } .tree .dim { color: #585b70; } .tree .arrow { color: #6c7086; }
+
+  .phase { background: var(--card); border-radius: 12px; padding: 20px 24px; box-shadow: 0 1px 3px rgba(0,0,0,.08); margin-bottom: 16px; }
+  .phase h3 { font-size: 16px; margin-bottom: 10px; display: flex; align-items: center; gap: 10px; }
+  .phase .status { font-size: 11px; padding: 2px 10px; border-radius: 10px; font-weight: 600; }
+  .phase .status.done { background: #d8f3dc; color: var(--green); }
+  .phase .status.pending { background: #e9ecef; color: var(--muted); }
+
+  .sub-stage { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-radius: 8px; margin: 4px 0; }
+  .sub-stage:hover { background: #f1f3f5; }
+  .sub-stage .idx { font-size: 12px; font-weight: 600; color: var(--muted); min-width: 28px; }
+  .sub-stage .label { font-size: 14px; flex: 1; }
+  .sub-stage .label small { font-size: 12px; color: var(--muted); }
+  .sub-stage .tag { font-size: 11px; padding: 2px 8px; border-radius: 10px; background: #e9ecef; color: var(--muted); }
+  .sub-stage .tag.done { background: #d8f3dc; color: var(--green); }
+  .sub-stage .tag.now { background: #eef0ff; color: var(--blue); font-weight: 600; }
+
+  .future { padding: 6px 12px; font-size: 13px; color: var(--muted); margin: 2px 0; }
+
+  .diagram-card { cursor: pointer; }
+  .diagram-card .preview img { cursor: pointer; }
+
+  /* Lightbox */
+  .lightbox {
+    display: none; position: fixed; z-index: 9999; left: 0; top: 0;
+    width: 100%; height: 100%; background: rgba(0,0,0,.85);
+    justify-content: center; align-items: center; padding: 40px;
+  }
+  .lightbox.show { display: flex; }
+  .lightbox img {
+    max-width: 95%; max-height: 95%; object-fit: contain;
+    border-radius: 8px; box-shadow: 0 4px 24px rgba(0,0,0,.5);
+  }
+  .lightbox .close {
+    position: absolute; top: 20px; right: 30px;
+    font-size: 36px; color: white; cursor: pointer;
+    font-family: sans-serif; line-height: 1;
+  }
+  .lightbox .close:hover { opacity: .7; }
+
+  @media (max-width: 600px) { .header { padding: 24px 20px; } .diagram-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="container">
+
+<div class="header">
+  <h1>MNN 推理引擎源码学习</h1>
+  <p>以模型为线索，组件图 + 时序图 + 类图 + 流程图全程辅助，逐阶段深入推理引擎核心</p>
+  <div class="badges"><span>6 个阶段</span><span>模型加载 → 图优化 → 异构调度 → 后端执行</span><span>推理引擎面试准备</span></div>
+</div>
+
+<!-- 已有图表 -->
+<h2>图表</h2>
+<div class="diagram-grid">
+  <div class="diagram-card" onclick="openLightbox(this)">
+    <div class="preview"><img src="mnn_component_diagram.png" alt="组件图"></div>
+    <div class="info"><div class="name">组件图</div><div class="desc">MNN 模块划分与依赖</div></div>
+  </div>
+  <div class="diagram-card" onclick="openLightbox(this)">
+    <div class="preview"><img src="mnn_inference_flow.png" alt="时序图"></div>
+    <div class="info"><div class="name">推理流程时序图</div><div class="desc">5 阶段调用链</div></div>
+  </div>
+  <div class="diagram-card" onclick="openLightbox(this)">
+    <div class="preview"><img src="mnn_class_diagram.png" alt="类图"></div>
+    <div class="info"><div class="name">核心类图（v2）</div><div class="desc">Interpreter/Session/Pipeline · SizeComputer/Geometry 继承 · OpCacheInfo/Command</div></div>
+  </div>
+  <div class="diagram-card" onclick="openLightbox(this)">
+    <div class="preview"><img src="mnn_analogy.png" alt="类比图"></div>
+    <div class="info"><div class="name">5 步推理流程类比图</div><div class="desc">Interpreter→Schedule→Session→Pipeline→Execution</div></div>
+  </div>
+</div>
+
+<!-- Lightbox -->
+<div class="lightbox" id="lightbox" onclick="closeLightbox()">
+  <span class="close" onclick="closeLightbox()">&times;</span>
+  <img id="lightbox-img" src="">
+</div>
+
+<!-- 目录结构 -->
+<h2>目录结构</h2>
+<div class="tree">docs/
+<span class="arrow">├──</span> <span class="file">mnn.html</span>                  <span class="dim">  本文件</span>
+<span class="arrow">├──</span> <span class="file">mnn_component_diagram.png</span>   <span class="dim">  组件图</span>
+<span class="arrow">├──</span> <span class="file">mnn_inference_flow.png</span>     <span class="dim">  时序图</span>
+<span class="arrow">└──</span> <span class="folder">study/</span>
+    <span class="arrow">    └──</span> <span class="folder">01-basics/</span>
+    <span class="arrow">        ├──</span> <span class="file">01-model-loading/index.html</span>   <span class="dim">  ✓</span>
+    <span class="arrow">        ├──</span> <span class="file">02-session-create/index.html</span>  <span class="dim">  ✓</span>
+    <span class="arrow">        ├──</span> <span class="file">03-resize-optimize/index.html</span> <span class="dim">  ✓</span>
+    <span class="arrow">        ├──</span> <span class="file">04-execute/index.html</span>         <span class="dim">  ✓</span>
+    <span class="arrow">        ├──</span> <span class="file">resnet18-data-flow.html</span>   <span class="new">  ResNet18 数据流转演示</span>
+    <span class="arrow">        └──</span> <span class="file">05-read-result/index.html</span>     <span class="dim"> 待学</span>
+</div>
+
+<!-- 第一阶段 -->
+<div class="phase">
+<h3>第一阶段：基础铺垫 <span class="status done">学习中</span></h3>
+<p style="font-size:13px;color:var(--muted);margin-bottom:10px;">时序图 5 阶段，逐个深入。当前进度：4/5 深度完成（模型加载 / Session create / resize+allocMemory / 推理执行），1/5 基本完成（Demo）。</p>
+
+<div class="sub-stage">
+  <span class="idx">01</span>
+  <span class="label"><a href="study/01-basics/01-model-loading/index.html">模型加载</a> <small>FileLoader → FlatBuffers 反序列化</small></span>
+  <span class="tag done">已完成</span>
+</div>
+<div class="sub-stage">
+  <span class="idx">02</span>
+  <span class="label"><a href="study/01-basics/02-session-create/index.html">创建 Session</a> <small>createRuntime · Schedule::schedule · init(Const)Tensors · 常量折叠 · Session 构造 · 缓存</small></span>
+  <span class="tag done">深度完成</span>
+</div>
+<div class="sub-stage">
+  <span class="idx">03</span>
+  <span class="label"><a href="study/01-basics/03-resize-optimize/index.html">resize 图优化</a> <small>encode: SizeComputer + GeometryComputer + 常量折叠 · allocMemory: Execution创建 + 跨后端Copy + useCount内存复用</small></span>
+  <span class="tag done">深度完成</span>
+</div>
+<div class="sub-stage">
+  <span class="idx">04</span>
+  <span class="label"><a href="study/01-basics/04-execute/index.html">推理执行</a> <small>Pipeline execute 调度 · Backend onExecute · 生命周期（allocMemory 部分已深度完成）</small></span>
+  <span class="tag done">深度完成</span>
+</div>
+<div class="sub-stage">
+  <span class="idx">05</span>
+  <span class="label"><a href="study/01-basics/05-read-result/index.html">读取结果</a> <small>Tensor 访问 · 内存管理</small></span>
+  <span class="tag now">学习中</span>
+</div>
+<div class="sub-stage">
+  <span class="idx">06</span>
+  <span class="label"><a href="study/01-basics/06-demo-analysis/index.html">Demo 完整流程</a> <small>pictureRecognition.cpp 逐阶段解析</small></span>
+  <span class="tag done">已完成</span>
+</div>
+</div>
+
+<!-- Session 创建深度总结 -->
+<div class="phase" style="border-left: 3px solid var(--green);">
+<h3>Session 创建 — 深度总结 <span class="status done">已完成</span></h3>
+<div style="font-size:13px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px 24px; margin-top: 8px;">
+  <div>createRuntime → RuntimeFactory::create()</div>
+  <div>ScheduleConfig / Path 模型切分</div>
+  <div>initConstTensors（遍历 CONST Op，创建 + 填充权重 + 分配内存）</div>
+  <div>initTensors（补齐壳子、输入形状、量化参数、静态模型全部形状）</div>
+  <div>allTensors 索引映射（FlatBuffers index → Tensor*）</div>
+  <div>_scheduleUnit → Pipeline 算子列表</div>
+  <div>setInputOutputForOps（标记 INPUT/OUTPUT/NORMAL）</div>
+  <div>buildConstantTensors（常量折叠 + breakIndex 切割）</div>
+  <div>Session 构造函数（createPipelineBackend + new Pipeline）</div>
+  <div>RuntimeInfo 结构（map&lt;Type,Runtime&gt; + 默认 Runtime）</div>
+  <div>调优缓存（读缓存 → 首次 tuning → 写缓存）</div>
+  <div>auto resize（条件判断 + resizeMode/inputMode）</div>
+</div>
+</div>
+
+	<!-- resize 深度总结 -->
+	<div class="phase" style="border-left: 3px solid var(--blue);">
+	<h3>resize + allocMemory — 深度总结 <span class="status done">深度完成</span></h3>
+	<div style="font-size:13px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px 24px; margin-top: 8px;">
+	  <div>encode/allocMemory 两阶段分离（数学 vs 硬件）</div>
+	  <div>静态/动态模型分路径（needComputeGeometry）</div>
+	  <div>OpResizeCache 增量检测（match/insert/close）</div>
+	  <div>SizeComputer 形状推导（70+ 子类，数学公式）</div>
+	  <div>SizeComputerSuite 注册表（search O(1) 哈希查找）</div>
+	  <div>GeometryComputer Op 分解（Conv→Im2Col+MatMul 等）</div>
+	  <div>常量折叠：encode 阶段 CPU 执行 + STATIC 内存写入</div>
+	  <div>CONTENT_NOT_CHANGE 脏标记链（避免重复计算）</div>
+	  <div>_createExecutions 4 层优先级（cache→KV→primary→CPU）</div>
+	  <div>_SetTensorBackend 标记 Tensor 归属 Backend</div>
+	  <div>_InsertCopy 跨后端 Wrap（workInputs 赋值点）</div>
+	  <div>_allocForTensor 引用计数内存复用（useCount）</div>
+	  <div>三种内存类型（STATIC / DYNAMIC_SEPERATE / DYNAMIC）</div>
+	  <div>opFuse 编译期 GPU 逐元素融合（MNN_BUILD_CODEGEN）</div>
+	  <div>fixResizeCache group 固定内存（避免重复分配）</div>
+	  <div>自动调优：异步 GPU tuning + CPU fallback</div>
+	</div>
+	</div>
+
+<!-- 后续阶段占位 -->
+<div class="phase">
+<h3>第二阶段：CNN 模型 <span class="status pending">未开始</span></h3>
+<div class="future">Conv Im2Col+GEMM · 深度可分离卷积 · Winograd · NC4HW4 · INT8 量化</div>
+</div>
+<div class="phase">
+<h3>第三阶段：Transformer <span class="status pending">未开始</span></h3>
+<div class="future">Attention · LayerNorm · Softmax · KV Cache · MNN Op 注册模式</div>
+</div>
+<div class="phase">
+<h3>第四阶段：LLM 大模型 <span class="status pending">未开始</span></h3>
+<div class="future">导出 · llm.cpp · Prefill/Decode · KVCache · RoPE · INT4 量化 · Benchmark</div>
+</div>
+<div class="phase">
+<h3>第五阶段：Diffusion <span class="status pending">未开始</span></h3>
+<div class="future">UNet · Text Encoder · VAE · 调度器</div>
+</div>
+<div class="phase">
+<h3>第六阶段：后端与异构 <span class="status pending">未开始</span></h3>
+<div class="future">ARM NEON · Metal · CUDA · OpenCL · Vulkan · Backend 注册机制</div>
+</div>
+
+<div style="text-align:center;color:var(--muted);font-size:13px;padding:40px 0 20px;">
+  2026-05-15 · 更新 2026-05-27
+</div>
+
+<script>
+function openLightbox(card) {
+  var img = card.querySelector('img');
+  if (!img) return;
+  document.getElementById('lightbox-img').src = img.src;
+  document.getElementById('lightbox').classList.add('show');
+}
+function closeLightbox() {
+  document.getElementById('lightbox').classList.remove('show');
+}
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') closeLightbox();
+});
+</script>
+</div>
+</body>
+</html>
