@@ -166,6 +166,37 @@ int postTreat(std::unique_ptr<MNN::NetT>& netT, const modelConfig& config) {
             }
         }
     }
+    // Fuse BinaryOp(Add) + LayerNorm → 2-input LayerNorm
+    // Strategy: keep the Add op in the graph (to preserve tensor indices for LLM engine),
+    // but rewire LayerNorm to take Add's inputs directly. The Add op becomes a dead op.
+    auto fuseAddLayerNorm = [](std::vector<std::unique_ptr<OpT>>& ops) -> int {
+        int fused = 0;
+        for (int i = 0; i + 1 < (int)ops.size(); i++) {
+            if (ops[i]->type != OpType_BinaryOp || ops[i+1]->type != OpType_LayerNorm) continue;
+            if (ops[i]->main.AsBinaryOp()->opType != BinaryOpOperation_ADD) continue;
+            if (!ops[i]->outputIndexes.size() || !ops[i+1]->inputIndexes.size()) continue;
+            if (ops[i]->outputIndexes[0] != ops[i+1]->inputIndexes[0]) continue;
+            if (ops[i+1]->inputIndexes.size() != 1 || ops[i]->inputIndexes.size() < 2) continue;
+            auto ln = ops[i+1]->main.AsLayerNorm();
+            if (!ln || !ln->useRMSNorm) continue;
+            // Fuse: LayerNorm gets Add's data + residual as 2 inputs.
+            // Keep Add op and its output tensor to preserve tensor indices for LLM engine.
+            ops[i+1]->inputIndexes = {ops[i]->inputIndexes[0], ops[i]->inputIndexes[1]};
+            // NOTE: Do NOT erase the Add op — keep it to preserve FlatBuffer index stability
+            fused++;
+        }
+        return fused;
+    };
+    {
+        int fused = fuseAddLayerNorm(netT->oplists);
+        for (auto& subgraph : netT->subgraphs) {
+            fused += fuseAddLayerNorm(subgraph->nodes);
+        }
+        if (fused > 0) {
+            MNN_PRINT("Fused %d Add+LayerNorm pairs (converter pass)\n", fused);
+        }
+    }
+
     {
         MNNRemoveFile(".__convert_external_data.bin");
     }
