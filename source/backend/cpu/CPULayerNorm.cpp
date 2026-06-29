@@ -150,18 +150,41 @@ ErrorCode CPULayerNorm::onExecute(const std::vector<Tensor*>& inputs, const std:
             if (bytes != 4) {
                 auto tmpInput = (float*)(mTmpInputFloat.ptr() + ttId * mInnerSize * sizeof(float));
                 auto tmpOutput = (float*)(mTmpOutputFloat.ptr() + ttId * mInnerSize * sizeof(float));
+                // Cast first input (data) to FP32
                 if (bytes == 1) {
                     CPUCastCreator::cast(inner_input, tmpInput, CPUCastCreator::INT8_TO_FlOAT, mInnerSize,
                                          inputQuan->scale, inputQuan->zero, inputQuan->min, inputQuan->max, bn);
                 } else {
                     core->MNNLowpToFp32((const int16_t*)inner_input, tmpInput, mInnerSize);
                 }
-                MNNNorm(tmpOutput, tmpInput, gamma, beta, mResource->mEpsilon, mInnerSize, mResource->mRMSNorm);
-                if (bytes == 1) {
-                    CPUCastCreator::cast(tmpOutput, inner_output, CPUCastCreator::FlOAT_TO_INT8, mInnerSize,
-                                         outputQuan->scale, outputQuan->zero, outputQuan->min, outputQuan->max, bn);
+                // Fused Add + RMSNorm: cast residual to FP32, then use NEON fused kernel
+                if (inputs.size() >= 2 && mResource->mRMSNorm) {
+                    // Cast residual to tmpOutput (reuse as FP32 buffer for residual)
+                    auto tmpResidual = tmpOutput; // reuse tmpOutput for residual
+                    const float* residual = (const float*)(inputs[1]->host<uint8_t>() + tId * mInnerSize * bytes);
+                    if (bytes == 1) {
+                        CPUCastCreator::cast(residual, tmpResidual, CPUCastCreator::INT8_TO_FlOAT, mInnerSize,
+                                             inputQuan->scale, inputQuan->zero, inputQuan->min, inputQuan->max, bn);
+                    } else {
+                        core->MNNLowpToFp32((const int16_t*)residual, tmpResidual, mInnerSize);
+                    }
+                    // Use NEON fused kernel: result = RMSNorm(tmpInput + tmpResidual)
+                    MNNAddAndRMSNorm(tmpOutput, tmpInput, tmpResidual, gamma, mResource->mEpsilon, mInnerSize);
+                    // Cast back
+                    if (bytes == 1) {
+                        CPUCastCreator::cast(tmpOutput, inner_output, CPUCastCreator::FlOAT_TO_INT8, mInnerSize,
+                                             outputQuan->scale, outputQuan->zero, outputQuan->min, outputQuan->max, bn);
+                    } else {
+                        core->MNNFp32ToLowp(tmpOutput, (int16_t*)inner_output, mInnerSize);
+                    }
                 } else {
-                    core->MNNFp32ToLowp(tmpOutput, (int16_t*)inner_output, mInnerSize);
+                    MNNNorm(tmpOutput, tmpInput, gamma, beta, mResource->mEpsilon, mInnerSize, mResource->mRMSNorm);
+                    if (bytes == 1) {
+                        CPUCastCreator::cast(tmpOutput, inner_output, CPUCastCreator::FlOAT_TO_INT8, mInnerSize,
+                                             outputQuan->scale, outputQuan->zero, outputQuan->min, outputQuan->max, bn);
+                    } else {
+                        core->MNNFp32ToLowp(tmpOutput, (int16_t*)inner_output, mInnerSize);
+                    }
                 }
             } else {
                 // Fused Add + RMSNorm path (2 inputs = data + residual)
